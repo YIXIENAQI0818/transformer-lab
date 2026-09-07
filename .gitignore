@@ -1,0 +1,29 @@
+# AI 元文件（禁止上传到 GitHub）
+CLAUDE.md
+memory/
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# 数据与模型产物
+data/*.bin
+data/*.idx
+data/*.txt
+data/*.json
+*.pt
+*.pth
+ckpt/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+.ipynb_checkpoints/
