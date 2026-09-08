@@ -89,22 +89,27 @@ tokenizer 也分「数据 + 代码」：
 
 ---
 
-## 步骤⑤ `05_import_ollama.sh` —— 导入 Ollama
+## 步骤⑤ `05_import_ollama.sh` —— 导入 Ollama（走 safetensors）
 
-写一个 `Modelfile`（`FROM ./out/hf`），然后：
+写一个 `Modelfile`（`FROM ./out/hf`），然后 `ollama create --experimental my-gpt -f Modelfile`。
+结果：`ollama create` 成功读懂了我们的 `model.safetensors` + `config.json` + `vocab.json`，把 76 个 tensor 导入成 `my-gpt`（出现在 `ollama list`）——证明「迁移到 HF → Ollama 识别」的链路是通的。
 
-```bash
-ollama create --experimental my-gpt -f Modelfile   # 直接读 safetensors，自动转 GGUF
-ollama list                                        # 出现 my-gpt（43 MB）
-ollama run my-gpt "ROMEO:"                         # 生成
-```
+**但 `ollama run` 报 `MLX not available`**：Ollama 0.33.2 的 `--experimental` safetensors 导入在 Linux 上依赖 MLX（Apple 框架，macOS 专用）。
 
-**结论**：`ollama create` 成功读懂了我们的 `model.safetensors` + `config.json` + `vocab.json`，把 76 个 tensor 导入成 `my-gpt`（出现在 `ollama list`）——这证明了「迁移到 HF → Ollama 使用」的链路是通的。
+## 步骤⑥ `06_write_gguf.py` —— 手动写 GGUF（绕开 MLX）
 
-**⚠️ 已知障碍（环境限制，非迁移问题）**：Ollama 0.33.2 的 `--experimental` safetensors 导入在 **Linux 上依赖 MLX**（Apple 的机器学习框架，macOS 专用），运行/量化时报 `MLX not available`。两条绕过方向：
+标准 GGUF 走 llama.cpp runner（本机 `qwen2.5:3b` 就是 GGUF 能跑），所以用 `pip install gguf` 的 `GGUFWriter` 直接把 ckpt 写成 GGUF（**从原始 ckpt 写，tensor 是 Linear 布局，不用转置**）。
 
-1. **手动写 GGUF**（用 `pip install gguf` 的 `GGUFWriter`，绕开 Ollama 的 MLX 量化器）——标准 GGUF 走 llama.cpp runner，本机 `qwen2.5:3b` 就是 GGUF 能正常跑。这是最干净的下一步。
-2. **降级/换 Ollama 版本**，或换用 llama.cpp 直接跑。
+结果：`out/gguf/model.gguf`（43.2 MB）生成成功，**权重 + 结构元数据（`general.architecture="gpt2"` + `gpt2.*` 字段）都正确**，`ollama create` 也能加载。
+
+**但 `ollama run` 报 `cannot find tokenizer merges`**，这是最终卡点，且是**根本性限制**：
+
+> char-level 分词「每个字符一个 token、无 BPE 合并规则」→ `merges` 天然为空；
+> 但 GGUF 的 ARRAY 类型**不支持空数组**（`gguf` 库 `raise ValueError`）；
+> 而不写 `merges` 字段，llama.cpp 又报「找不到 merges」。
+> 三方矛盾，无法同时满足。
+
+**结论**：这不是迁移代码的 bug，而是 **llama.cpp 生态从设计上就不支持 char-level**（它只为 BPE / sentencepiece 这类「有合并规则」的分词器设计）。要真正 `ollama run` 跑起来，需在 `pretraining` 进阶阶段**换成 BPE tokenizer**——届时 `merges` 非空，GGUF 就能完整表达。
 
 另外一个小坑：`ollama create` 后若 `ollama list` 看不到新模型，是**旧 ollama server 没刷新**，重启 server 即可（`ollama stop` 在新版是停模型，需 kill 进程或用新端口 `OLLAMA_HOST=127.0.0.1:11435 ollama serve`）。
 

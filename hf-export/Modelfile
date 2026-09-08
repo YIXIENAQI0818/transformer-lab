@@ -1,11 +1,9 @@
-# Ollama 的 Modelfile：把我们的 HF 模型（safetensors）导入成 Ollama 模型
+# Ollama 的 Modelfile：加载我们手动生成的 GGUF
 #
-# FROM 指向 HF 模型目录（含 model.safetensors + config.json + tokenizer）。
-# Ollama 0.33+ 的 --experimental 标志支持直接从 safetensors 创建模型，
-# 内部会自动转成它需要的 GGUF，省去我们手动转换那一步。
+# FROM 指向 GGUF 文件（单文件自描述，llama.cpp runner 能读，绕开 MLX 限制）。
 #
 # 用法（在 hf-export/ 目录下）：
-#   ollama create --experimental my-gpt -f Modelfile
+#   ollama create my-gpt -f Modelfile
 #   ollama run my-gpt "ROMEO:"
 
-FROM ./out/hf
+FROM ./out/gguf/model.gguf
