@@ -1,6 +1,8 @@
-# 把自建 GPT 导出到 HF / Ollama —— 逐步详解
+# 把自建 GPT 导出到 HF 标准格式 —— 逐步详解
 
-这个项目回答一个问题：**我们手写训练的 `ckpt.pt`，怎么变成 `AutoModel.from_pretrained` 和 `ollama run` 都能用的标准模型？**
+这个项目回答一个问题：**我们手写训练的 `ckpt.pt`，怎么变成 `AutoModel.from_pretrained` 能加载的标准 HF 模型？**
+
+> 部署侧（vLLM / Ollama 等）后续在 llm-lab 里做，本子项目**只做到 HF 格式为止**——因为 HF 格式是「训练/微调 → 部署」整条链的枢纽：训练产 HF、微调产 HF、vLLM 也吃 HF。
 
 ## 核心理解：数据 vs 代码
 
@@ -10,7 +12,7 @@
 > - **数据**：权重（一堆 float 数字）+ 词表（char↔id 映射）
 > - **代码**：模型结构（怎么算 attention）+ tokenizer 算法（怎么 encode/decode）
 
-我们的 `ckpt.pt`（数据）+ `model.py`/`tokenizer.py`（代码）都在自己仓库里。HF 和 Ollama 的区别只是：**它们把「代码」内置得更全、把「数据」格式更标准**。所以「迁移」的本质，就是把我们的「数据」按标准格式存好、把「代码」对应到标准库已有的实现上。
+我们的 `ckpt.pt`（数据）+ `model.py`/`tokenizer.py`（代码）都在自己仓库里。transformers 库把「代码」内置得很全、把「数据」格式定得很标准。所以「迁移」的本质，就是把我们的「数据」按 HF 标准存好、把「代码」对应到 transformers 库里已有的实现上。
 
 我们的模型结构恰好就是**标准 GPT-2**（阶段 1 照 nanoGPT/GPT-2 写的），所以「结构代码」可以直接复用 transformers 的 `GPT2LMHeadModel`——这就是为什么迁移比想象的简单。
 
@@ -27,10 +29,8 @@ pretraining/out/ckpt.pt          （数据：state_dict + config + meta）
         ├── ③ tokenizer 迁移 ── stoi/itos → vocab.json + 自定义 PreTrainedTokenizer
         │        └─→ out/hf/vocab.json + tokenizer_config.json
         │
-        ├── ④ 验证 ── AutoModel 加载，logits 与原模型逐元素一致
-        │
-        └── ⑤ 导入 Ollama ── ollama create --experimental 读 safetensors
-                 └─→ my-gpt（受 Ollama 0.33.2 Linux MLX 限制，见文末）
+        └── ④ 验证 ── AutoModel 加载，logits 与原模型逐元素一致
+                 └─→ 标准 HF 格式，可直接被 transformers / vLLM 使用
 ```
 
 ---
@@ -89,29 +89,16 @@ tokenizer 也分「数据 + 代码」：
 
 ---
 
-## 步骤⑤ `05_import_ollama.sh` —— 导入 Ollama（走 safetensors）
+## 之后怎么部署（vLLM）
 
-写一个 `Modelfile`（`FROM ./out/hf`），然后 `ollama create --experimental my-gpt -f Modelfile`。
-结果：`ollama create` 成功读懂了我们的 `model.safetensors` + `config.json` + `vocab.json`，把 76 个 tensor 导入成 `my-gpt`（出现在 `ollama list`）——证明「迁移到 HF → Ollama 识别」的链路是通的。
+HF 格式落地后，部署直接走 vLLM（它内部用 transformers 加载，**直接吃 HF 格式**，无需转换）：
 
-**但 `ollama run` 报 `MLX not available`**：Ollama 0.33.2 的 `--experimental` safetensors 导入在 Linux 上依赖 MLX（Apple 框架，macOS 专用）。
+```bash
+pip install vllm
+vllm serve out/hf        # 起一个 OpenAI 兼容服务，和 Ollama 一样提供 API
+```
 
-## 步骤⑥ `06_write_gguf.py` —— 手动写 GGUF（绕开 MLX）
-
-标准 GGUF 走 llama.cpp runner（本机 `qwen2.5:3b` 就是 GGUF 能跑），所以用 `pip install gguf` 的 `GGUFWriter` 直接把 ckpt 写成 GGUF（**从原始 ckpt 写，tensor 是 Linear 布局，不用转置**）。
-
-结果：`out/gguf/model.gguf`（43.2 MB）生成成功，**权重 + 结构元数据（`general.architecture="gpt2"` + `gpt2.*` 字段）都正确**，`ollama create` 也能加载。
-
-**但 `ollama run` 报 `cannot find tokenizer merges`**，这是最终卡点，且是**根本性限制**：
-
-> char-level 分词「每个字符一个 token、无 BPE 合并规则」→ `merges` 天然为空；
-> 但 GGUF 的 ARRAY 类型**不支持空数组**（`gguf` 库 `raise ValueError`）；
-> 而不写 `merges` 字段，llama.cpp 又报「找不到 merges」。
-> 三方矛盾，无法同时满足。
-
-**结论**：这不是迁移代码的 bug，而是 **llama.cpp 生态从设计上就不支持 char-level**（它只为 BPE / sentencepiece 这类「有合并规则」的分词器设计）。要真正 `ollama run` 跑起来，需在 `pretraining` 进阶阶段**换成 BPE tokenizer**——届时 `merges` 非空，GGUF 就能完整表达。
-
-另外一个小坑：`ollama create` 后若 `ollama list` 看不到新模型，是**旧 ollama server 没刷新**，重启 server 即可（`ollama stop` 在新版是停模型，需 kill 进程或用新端口 `OLLAMA_HOST=127.0.0.1:11435 ollama serve`）。
+这条「transformers 训练 → HF 格式 → vLLM 部署」的链路，后续在 llm-lab 里对大模型微调后同样适用（微调产出也是 HF 格式）。
 
 ---
 

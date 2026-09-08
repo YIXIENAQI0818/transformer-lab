@@ -1,9 +1,0 @@
-# Ollama 的 Modelfile：加载我们手动生成的 GGUF
-#
-# FROM 指向 GGUF 文件（单文件自描述，llama.cpp runner 能读，绕开 MLX 限制）。
-#
-# 用法（在 hf-export/ 目录下）：
-#   ollama create my-gpt -f Modelfile
-#   ollama run my-gpt "ROMEO:"
-
-FROM ./out/gguf/model.gguf
