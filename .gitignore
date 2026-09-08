@@ -14,13 +14,14 @@ dist/
 build/
 
 # 数据与模型产物
-data/*.bin
-data/*.idx
-data/*.txt
-data/*.json
+**/data/*.bin
+**/data/*.idx
+**/data/*.txt
+**/data/*.json
 *.pt
 *.pth
 ckpt/
+out/
 
 # 编辑器 / 系统
 .DS_Store
