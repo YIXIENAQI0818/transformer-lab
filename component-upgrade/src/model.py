@@ -8,6 +8,7 @@
     pos_enc:    "learned"（朴素 wpe） | "rope"（旋转位置编码，见 rope.py）
     norm:       "layernorm"（朴素 LN） | "rmsnorm"（RMS 归一化，见 rmsnorm.py）
     activation: "gelu"（朴素 FFN） | "swiglu"（门控 FFN，见 swiglu.py）
+    n_kv_head:  K/V 头数（0 = n_head 即 MHA；2 = GQA，见 gqa.py）
 
 前向：idx (B,T) -> logits (B,T,vocab_size)；给 targets 则返回 (logits, loss)。
 """
@@ -35,6 +36,7 @@ class GPTConfig:
     pos_enc: str = "learned"  # "learned" | "rope"
     norm: str = "layernorm"   # "layernorm" | "rmsnorm"
     activation: str = "gelu"  # "gelu" | "swiglu"（swiglu 是门控结构，替换整个 FFN 而非仅激活函数）
+    n_kv_head: int = 0  # K/V 头数：0 = 等于 n_head（MHA）；设 2 = GQA，1 = MQA（K/V 头共享，见 gqa.py）
 
 
 def _build_norm(config: GPTConfig, dim: int):
@@ -54,19 +56,32 @@ def _build_norm(config: GPTConfig, dim: int):
 
 
 class CausalSelfAttention(nn.Module):
-    """多头因果自注意力，支持 learned / rope 两种位置编码。"""
+    """多头因果自注意力，支持 learned / rope 位置编码，以及 MHA / GQA / MQA。
+
+    n_kv_head 控制 K/V 的头数（Q 始终是 n_head 个头）：
+      - n_kv_head = n_head  → MHA（每个 Q 头配自己的 K/V 头）
+      - n_kv_head < n_head  → GQA（多 Q 头分组共享 K/V 头）
+      - n_kv_head = 1       → MQA（所有 Q 头共享 1 个 K/V 头）
+    """
 
     def __init__(self, config: GPTConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head if config.n_kv_head > 0 else config.n_head
+        assert self.n_head % self.n_kv_head == 0, (
+            f"n_head={self.n_head} 必须能被 n_kv_head={self.n_kv_head} 整除（每组 Q 头数相等）"
+        )
         self.n_embd = config.n_embd
         self.head_size = config.n_embd // config.n_head
         self.block_size = config.block_size
         self.pos_enc = config.pos_enc
         self.dropout = config.dropout
+        # c_attn 输出：Q 全量 n_embd + K/V 各 n_kv_head * head_size（GQA 时 K/V 投影更窄）
+        self.c_attn = nn.Linear(
+            config.n_embd, config.n_embd + 2 * self.n_kv_head * self.head_size, bias=config.bias
+        )
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # causal mask：下三角为 1（可看到），上三角为 0（看不到未来）。注册为 buffer。
         self.register_buffer(
             "bias",
@@ -78,19 +93,32 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.shape
 
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        # Q 全量，K/V 各 n_kv_head 个头（维度不是均分三段了）
+        q, k, v = self.c_attn(x).split(
+            [self.n_embd, self.n_kv_head * self.head_size, self.n_kv_head * self.head_size],
+            dim=2,
+        )
 
-        # 切成多头：(B,T,n_embd) -> (B,n_head,T,head_size)
-        k = k.view(B, T, self.n_head, self.head_size).transpose(1, 2)
+        # 切多头：Q 切 n_head 个头，K/V 各切 n_kv_head 个头
         q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_head, self.head_size).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_head, self.head_size).transpose(1, 2)
 
-        # RoPE：对 q/k 按绝对位置旋转（v 不旋转，位置信息只影响 attention score）
+        # RoPE：对 q/k 按绝对位置旋转（v 不旋转，位置信息只影响 attention score）。
+        # 在广播前做，只对 n_kv_head 个 K 头旋转（先旋转再复制 = 先复制再旋转，但前者更省）。
         if self.pos_enc == "rope":
-            # 按当前长度现算 cos/sin（生产实现会预计算缓存；这里求清晰、且天然支持 T > block_size）
             cos, sin = precompute_rope_cache(self.head_size, T, device=x.device, dtype=x.dtype)
             q = apply_rotary_emb(q, cos, sin)
             k = apply_rotary_emb(k, cos, sin)
+
+        # GQA 关键：把 K/V 从 n_kv_head 个头广播到 n_head 个头。
+        # 用 repeat_interleave 而非 repeat——GQA 是「连续分组共享」：
+        #   [K0,K1] -> repeat_interleave(2) -> [K0,K0,K1,K1]（Q0/Q1 共享 K0，Q2/Q3 共享 K1）
+        #   repeat 会得到错误的 [K0,K1,K0,K1]（交错共享，不是 GQA 语义）。
+        if self.n_kv_head != self.n_head:
+            n_rep = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(n_rep, dim=1)
+            v = v.repeat_interleave(n_rep, dim=1)
 
         # 缩放点积注意力（手写）
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_size))
