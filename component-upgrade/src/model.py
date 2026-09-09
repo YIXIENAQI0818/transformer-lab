@@ -9,6 +9,7 @@
     norm:       "layernorm"（朴素 LN） | "rmsnorm"（RMS 归一化，见 rmsnorm.py）
     activation: "gelu"（朴素 FFN） | "swiglu"（门控 FFN，见 swiglu.py）
     n_kv_head:  K/V 头数（0 = n_head 即 MHA；2 = GQA，见 gqa.py）
+    attn_impl:  "naive"（手写 QKᵀ+softmax） | "flash"（F.scaled_dot_product_attention，见 flash_attn.py）
 
 前向：idx (B,T) -> logits (B,T,vocab_size)；给 targets 则返回 (logits, loss)。
 """
@@ -37,6 +38,7 @@ class GPTConfig:
     norm: str = "layernorm"   # "layernorm" | "rmsnorm"
     activation: str = "gelu"  # "gelu" | "swiglu"（swiglu 是门控结构，替换整个 FFN 而非仅激活函数）
     n_kv_head: int = 0  # K/V 头数：0 = 等于 n_head（MHA）；设 2 = GQA，1 = MQA（K/V 头共享，见 gqa.py）
+    attn_impl: str = "naive"  # "naive" | "flash"（注意力实现，见 flash_attn.py）
 
 
 def _build_norm(config: GPTConfig, dim: int):
@@ -76,6 +78,7 @@ class CausalSelfAttention(nn.Module):
         self.head_size = config.n_embd // config.n_head
         self.block_size = config.block_size
         self.pos_enc = config.pos_enc
+        self.attn_impl = config.attn_impl
         self.dropout = config.dropout
         # c_attn 输出：Q 全量 n_embd + K/V 各 n_kv_head * head_size（GQA 时 K/V 投影更窄）
         self.c_attn = nn.Linear(
@@ -120,17 +123,31 @@ class CausalSelfAttention(nn.Module):
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
 
-        # 缩放点积注意力（手写）
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_size))
-        if T <= self.block_size:
-            mask = self.bias[:, :, :T, :T]
-        else:
-            # 长度外推时现算一个更大的下三角 mask（只有 rope 模式能走到这里）
-            mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-        att = att.masked_fill(mask == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = F.dropout(att, p=self.dropout, training=self.training)
-        y = att @ v  # (B,n_head,T,head_size)
+        # 注意力计算，按 attn_impl 分支：
+        #   "naive"：手写 QKᵀ + softmax，物化完整 (B,n_head,T,T) 矩阵（显存 O(T²)）
+        #   "flash"：交给 F.scaled_dot_product_attention（PyTorch 内置 fused 实现，底层即
+        #            FlashAttention / memory-efficient attention，不物化 T² 矩阵，见 flash_attn.py）
+        if self.attn_impl == "naive":
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_size))
+            if T <= self.block_size:
+                mask = self.bias[:, :, :T, :T]
+            else:
+                # 长度外推时现算一个更大的下三角 mask（只有 rope 模式能走到这里）
+                mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
+            att = att.masked_fill(mask == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            att = F.dropout(att, p=self.dropout, training=self.training)
+            y = att @ v  # (B,n_head,T,head_size)
+        else:  # flash
+            # sdpa 的 is_causal 用内置因果 mask（不占 block_size² 的 buffer，任意长度可用），
+            # scale 默认 1/sqrt(head_size) 与 naive 一致；dropout 仅训练时生效。
+            # k/v 已在前面 repeat_interleave 广播到 n_head（sdpa 本身也支持 GQA 广播，这里
+            # 统一先广播、两分支共用同一份 k/v，保证 naive/flash 输入完全一致）。
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
 
         # 拼回头并投影回 n_embd
         y = y.transpose(1, 2).contiguous().view(B, T, C)
