@@ -5,8 +5,9 @@
 （rope.py / rmsnorm.py / gqa.py ...）。
 
 当前已引入的开关：
-    pos_enc: "learned"（朴素 wpe） | "rope"（旋转位置编码，见 rope.py）
-    norm:    "layernorm"（朴素 LN） | "rmsnorm"（RMS 归一化，见 rmsnorm.py）
+    pos_enc:    "learned"（朴素 wpe） | "rope"（旋转位置编码，见 rope.py）
+    norm:       "layernorm"（朴素 LN） | "rmsnorm"（RMS 归一化，见 rmsnorm.py）
+    activation: "gelu"（朴素 FFN） | "swiglu"（门控 FFN，见 swiglu.py）
 
 前向：idx (B,T) -> logits (B,T,vocab_size)；给 targets 则返回 (logits, loss)。
 """
@@ -33,6 +34,7 @@ class GPTConfig:
     bias: bool = True
     pos_enc: str = "learned"  # "learned" | "rope"
     norm: str = "layernorm"   # "layernorm" | "rmsnorm"
+    activation: str = "gelu"  # "gelu" | "swiglu"（swiglu 是门控结构，替换整个 FFN 而非仅激活函数）
 
 
 def _build_norm(config: GPTConfig, dim: int):
@@ -108,19 +110,38 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """前馈网络 FFN：Linear -> GELU -> Linear，中间维度 4 * n_embd。"""
+    """前馈网络 FFN，按 config.activation 分两种结构。
+
+    - "gelu"  ：标准 FFN，Linear -> GELU -> Linear，中间维度 4 * n_embd。
+    - "swiglu"：门控 FFN，SwiGLU(x) = down(SiLU(gate(x)) ⊙ up(x))，三个投影，
+                 中间维度 8/3 * n_embd（对齐 4·d FFN 的参数量，见 swiglu.py）。
+    """
 
     def __init__(self, config: GPTConfig):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.activation = config.activation
+        if config.activation == "gelu":
+            self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+            self.gelu = nn.GELU()
+            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        elif config.activation == "swiglu":
+            # 中间维度 8/3·d：SwiGLU 有 3 个投影而 GELU 只有 2 个，取 8/3·d 使
+            # 总参数量 3·(d·8d/3) = 8d² 与标准 4·d FFN 的 2·(d·4d) = 8d² 对齐。
+            hidden = (8 * config.n_embd) // 3  # 整数运算，避免浮点误差（128 -> 341）
+            self.gate_proj = nn.Linear(config.n_embd, hidden, bias=config.bias)  # 门（过 SiLU）
+            self.up_proj = nn.Linear(config.n_embd, hidden, bias=config.bias)    # 值（不过激活）
+            self.down_proj = nn.Linear(hidden, config.n_embd, bias=config.bias)  # 输出
+        else:
+            raise ValueError(f"未知 activation: {config.activation}")
         self.dropout = config.dropout
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
+        if self.activation == "gelu":
+            x = self.c_fc(x)
+            x = self.gelu(x)
+            x = self.c_proj(x)
+        else:  # swiglu：SwiGLU(x) = down(SiLU(gate(x)) ⊙ up(x))
+            x = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
         return F.dropout(x, p=self.dropout, training=self.training)
 
 
@@ -163,7 +184,10 @@ class GPT(nn.Module):
         # GPT-2 初始化：残差路径缩放
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight"):
+            # 残差子层的输出投影（attention 的 c_proj、GELU FFN 的 c_proj、SwiGLU FFN 的
+            # down_proj）都缩小初始化，保证残差流在训练初期稳定；SwiGLU 的输出投影叫
+            # down_proj（LLaMA 惯例），需一并纳入，否则两种 FFN 初始化不一致、对比不公平。
+            if pn.endswith("c_proj.weight") or pn.endswith("down_proj.weight"):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
     def _init_weights(self, module):
