@@ -3,12 +3,16 @@
 在相同数据 / 相同种子下各训练一个只有位置编码不同的小 GPT，对比 loss 曲线，
 并演示 RoPE 的长度外推能力（训练 block_size=64，测试 T=128）。
 
-运行：python src/compare_rope.py [--steps N] [--block-size B] [--batch-size M] [--data PATH]
+运行：python scripts/compare_rope.py [--steps N] [--block-size B] [--batch-size M] [--data PATH]
 """
 import argparse
 import os
+import sys
 
 import torch
+
+# 让脚本能从 scripts/ 直接 import src/ 里的 model（scripts/ 与 src/ 同层）
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from model import GPT, GPTConfig
 
