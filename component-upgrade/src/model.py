@@ -11,6 +11,9 @@
     n_kv_head:  K/V 头数（0 = n_head 即 MHA；2 = GQA，见 gqa.py）
     attn_impl:  "naive"（手写 QKᵀ+softmax） | "flash"（F.scaled_dot_product_attention，见 flash_attn.py）
 
+KV cache 不是 config 开关而是前向参数（见 GPT.forward 的 cache/use_cache），它不改模型结构、
+只改推理时的计算方式，因此不加进 GPTConfig（见 kv_cache.py）。
+
 前向：idx (B,T) -> logits (B,T,vocab_size)；给 targets 则返回 (logits, loss)。
 """
 import math
@@ -93,7 +96,21 @@ class CausalSelfAttention(nn.Module):
             ),
         )
 
-    def forward(self, x):
+    def forward(self, x, cache=None, use_cache=False):
+        """前向。cache=None 是全序列自注意力（训练 / prefill）；cache 给定时是增量 decode。
+
+        cache: (k_cache, v_cache)，各 (B, n_kv_head, L, head_size)，L 是已缓存的过去 token 数。
+        增量 decode 时 x 只有 (B, 1, C)（一个新 token），把它的 k/v 追加进 cache 后，q 只
+        attend 到 [过去 L 个 + 自己]，天然满足因果（q 是最新位置、能看到全部 cache，无需 mask）。
+
+        返回（三种情况）：
+          - cache=None 且 use_cache=False：返回 y（训练路径，向后兼容）。
+          - cache=None 且 use_cache=True ：返回 (y, new_cache)，new_cache 是本层完整 (k, v)。
+          - cache 给定                      ：返回 (y, new_cache)，new_cache 是追加后的 (k, v)。
+
+        new_cache 永远存「未广播」的 n_kv_head 粒度（省显存的关键，见 gqa.py），广播到 n_head
+        放在 cache 追加之后、attention 之前。
+        """
         B, T, C = x.shape
 
         # Q 全量，K/V 各 n_kv_head 个头（维度不是均分三段了）
@@ -107,12 +124,25 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_kv_head, self.head_size).transpose(1, 2)
         v = v.view(B, T, self.n_kv_head, self.head_size).transpose(1, 2)
 
-        # RoPE：对 q/k 按绝对位置旋转（v 不旋转，位置信息只影响 attention score）。
-        # 在广播前做，只对 n_kv_head 个 K 头旋转（先旋转再复制 = 先复制再旋转，但前者更省）。
+        # RoPE：对 q/k 按**绝对位置**旋转（v 不旋转，位置信息只影响 attention score）。
+        # 增量 decode 时新 token 的绝对位置是 cache 的当前长度 pos_start，不能用局部下标 0——
+        # 否则每个新 token 都被当成位置 0 旋转，相对位置信息全错（这是 KV cache + RoPE 的经典 bug）。
         if self.pos_enc == "rope":
-            cos, sin = precompute_rope_cache(self.head_size, T, device=x.device, dtype=x.dtype)
+            pos_start = cache[0].size(2) if cache is not None else 0
+            cos, sin = precompute_rope_cache(
+                self.head_size, pos_start + T, device=x.device, dtype=x.dtype
+            )
+            cos = cos[pos_start:pos_start + T]
+            sin = sin[pos_start:pos_start + T]
             q = apply_rotary_emb(q, cos, sin)
             k = apply_rotary_emb(k, cos, sin)
+
+        # 先追加 cache 再广播：cache 必须存未广播的 n_kv_head 粒度（GQA 省显存的核心）。
+        if cache is not None:
+            k_cache, v_cache = cache
+            k = torch.cat([k_cache, k], dim=2)   # (B, n_kv_head, L+T, head_size)
+            v = torch.cat([v_cache, v], dim=2)
+        new_cache = (k, v) if (cache is not None or use_cache) else None
 
         # GQA 关键：把 K/V 从 n_kv_head 个头广播到 n_head 个头。
         # 用 repeat_interleave 而非 repeat——GQA 是「连续分组共享」：
@@ -124,34 +154,40 @@ class CausalSelfAttention(nn.Module):
             v = v.repeat_interleave(n_rep, dim=1)
 
         # 注意力计算，按 attn_impl 分支：
-        #   "naive"：手写 QKᵀ + softmax，物化完整 (B,n_head,T,T) 矩阵（显存 O(T²)）
+        #   "naive"：手写 QKᵀ + softmax，物化完整 score 矩阵（显存 O(T²)）
         #   "flash"：交给 F.scaled_dot_product_attention（PyTorch 内置 fused 实现，底层即
         #            FlashAttention / memory-efficient attention，不物化 T² 矩阵，见 flash_attn.py）
+        # 因果 mask 只在 cache=None（完整自注意力）时需要；decode 时 q 是最新位置、attend 到
+        # 全部 key 已天然因果，不套 mask（key 长度 L+T > query 长度 T，套方形 mask 反而错）。
         if self.attn_impl == "naive":
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_size))
-            if T <= self.block_size:
-                mask = self.bias[:, :, :T, :T]
-            else:
-                # 长度外推时现算一个更大的下三角 mask（只有 rope 模式能走到这里）
-                mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-            att = att.masked_fill(mask == 0, float("-inf"))
+            if cache is None:
+                if T <= self.block_size:
+                    mask = self.bias[:, :, :T, :T]
+                else:
+                    # 长度外推时现算一个更大的下三角 mask（只有 rope 模式能走到这里）
+                    mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
+                att = att.masked_fill(mask == 0, float("-inf"))
             att = F.softmax(att, dim=-1)
             att = F.dropout(att, p=self.dropout, training=self.training)
             y = att @ v  # (B,n_head,T,head_size)
         else:  # flash
             # sdpa 的 is_causal 用内置因果 mask（不占 block_size² 的 buffer，任意长度可用），
             # scale 默认 1/sqrt(head_size) 与 naive 一致；dropout 仅训练时生效。
-            # k/v 已在前面 repeat_interleave 广播到 n_head（sdpa 本身也支持 GQA 广播，这里
-            # 统一先广播、两分支共用同一份 k/v，保证 naive/flash 输入完全一致）。
+            # decode 时传 is_causal=False：q 是最新位置、应 attend 全部 key，无需因果 mask。
             y = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True,
+                is_causal=(cache is None),
             )
 
         # 拼回头并投影回 n_embd
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return F.dropout(self.c_proj(y), p=self.dropout, training=self.training)
+        y = F.dropout(self.c_proj(y), p=self.dropout, training=self.training)
+
+        if cache is not None or use_cache:
+            return y, new_cache
+        return y
 
 
 class MLP(nn.Module):
@@ -200,9 +236,18 @@ class Block(nn.Module):
         self.ln_2 = _build_norm(config, config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, cache=None, use_cache=False):
+        """pre-norm 的 attention + FFN，各带残差。cache 只沿 attention 进出（MLP 无状态、不缓存）。"""
+        want_cache = cache is not None or use_cache
+        attn_out = self.attn(self.ln_1(x), cache=cache, use_cache=use_cache)
+        if want_cache:
+            a, a_cache = attn_out
+        else:
+            a = attn_out
+        x = x + a
         x = x + self.mlp(self.ln_2(x))
+        if want_cache:
+            return x, a_cache
         return x
 
 
@@ -243,28 +288,49 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, cache=None, use_cache=False):
+        """前向。cache / use_cache 控制 KV cache（推理时复用过去 K/V，见 kv_cache.py）：
+
+          - cache=None, use_cache=False → 常规全序列前向（训练），返回 logits（或 (logits, loss)）。
+          - cache=None, use_cache=True  → prefill：全前向并返回 (logits, cache)。
+          - cache=<list>               → decode：idx 必须是 (B,1)，返回 (logits, new_cache)。
+
+        cache 是「每层一个 (k_cache, v_cache)」的 list，形状各 (B, n_kv_head, L, head_size)。
+        """
         B, T = idx.shape
 
         # token embedding（+ learned 位置 embedding）
         x = self.transformer.wte(idx)              # (B,T,n_embd)
         if "wpe" in self.transformer:
-            # learned 模式：wpe 只有 block_size 行，位置 >= block_size 无法编码。
-            # 注意 nn.Embedding 默认不做越界检查（会静默读出垃圾值），必须显式断言，
-            # 否则长度外推测试会"看似能跑"却得到错误结果。
-            assert T <= self.config.block_size, (
+            # learned 模式：位置编码从「绝对位置 pos_start」开始。增量 decode 时 cache 长度就是
+            # 绝对位置，不能总从 0 开始（否则每个新 token 都被当成位置 0，与 RoPE 的绝对位置
+            # 问题同源）。wpe 只有 block_size 行，位置 >= block_size 无法编码；nn.Embedding 默认
+            # 不做越界检查（会静默读出垃圾值），必须显式断言，否则长度外推测试"看似能跑"却得到错结果。
+            pos_start = cache[0][0].size(2) if cache is not None else 0
+            assert pos_start + T <= self.config.block_size, (
                 f"learned wpe 只能编码 block_size={self.config.block_size} 内的位置，"
-                f"收到 T={T}（长度外推需要 RoPE）"
+                f"当前位置 {pos_start}+{T} 越界（长度外推需要 RoPE）"
             )
-            pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+            pos = torch.arange(pos_start, pos_start + T, dtype=torch.long, device=idx.device)
             x = x + self.transformer.wpe(pos)
         x = self.transformer.drop(x)
 
-        for block in self.transformer.h:
-            x = block(x)
+        want_cache = cache is not None or use_cache
+        new_caches = []
+        for i, block in enumerate(self.transformer.h):
+            block_cache = cache[i] if cache is not None else None
+            out = block(x, cache=block_cache, use_cache=want_cache)
+            if want_cache:
+                x, block_new_cache = out
+                new_caches.append(block_new_cache)
+            else:
+                x = out
 
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)                   # (B,T,vocab_size)
+
+        if want_cache:
+            return logits, new_caches
 
         if targets is None:
             return logits
