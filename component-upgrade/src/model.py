@@ -6,6 +6,7 @@
 
 当前已引入的开关：
     pos_enc: "learned"（朴素 wpe） | "rope"（旋转位置编码，见 rope.py）
+    norm:    "layernorm"（朴素 LN） | "rmsnorm"（RMS 归一化，见 rmsnorm.py）
 
 前向：idx (B,T) -> logits (B,T,vocab_size)；给 targets 则返回 (logits, loss)。
 """
@@ -31,6 +32,23 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True
     pos_enc: str = "learned"  # "learned" | "rope"
+    norm: str = "layernorm"   # "layernorm" | "rmsnorm"
+
+
+def _build_norm(config: GPTConfig, dim: int):
+    """按 config.norm 建归一化层。
+
+    LayerNorm 有 gamma+beta 两个参数；RMSNorm 只有 gamma（省掉 beta 的 dim 个参数）。
+    注意 RMSNorm 本身无 bias，config.bias 对它不生效（这是 RMSNorm 的设计，不是遗漏）。
+
+    rmsnorm 分支直接用内置 nn.RMSNorm（PyTorch 的 fused 生产实现）；手写教学版在
+    rmsnorm.py，用于看清 RMSNorm 内部逻辑（见该文件 docstring）。
+    """
+    if config.norm == "layernorm":
+        return nn.LayerNorm(dim, bias=config.bias)
+    if config.norm == "rmsnorm":
+        return nn.RMSNorm(dim)
+    raise ValueError(f"未知 norm: {config.norm}")
 
 
 class CausalSelfAttention(nn.Module):
@@ -111,9 +129,9 @@ class Block(nn.Module):
 
     def __init__(self, config: GPTConfig):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = _build_norm(config, config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = _build_norm(config, config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -132,7 +150,7 @@ class GPT(nn.Module):
             wte=nn.Embedding(config.vocab_size, config.n_embd),
             drop=nn.Dropout(config.dropout),
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f=nn.LayerNorm(config.n_embd, bias=config.bias),
+            ln_f=_build_norm(config, config.n_embd),
         ))
         # learned 模式才需要位置 embedding；rope 模式下位置信息由 attention 内的旋转给出
         if config.pos_enc == "learned":
