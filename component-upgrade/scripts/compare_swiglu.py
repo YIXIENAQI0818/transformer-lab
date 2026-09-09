@@ -119,10 +119,12 @@ def main():
         return sum(p.numel() for p in GPT(cfg).parameters())
 
     def n_ffn_params(cfg):
-        """只数 FFN 子层的参数量，展示 8/3·d 对齐的关键。"""
-        keys = ("c_fc", "c_proj", "gate_proj", "up_proj", "down_proj")
-        return sum(p.numel() for n, p in GPT(cfg).named_parameters()
-                   if any(k in n for k in keys))
+        """只数 FFN 子层的参数量，展示 8/3·d 对齐的关键。
+
+        用 ".mlp." 精确匹配 FFN 子模块；注意不能用 "c_proj" 子串——它会同时命中
+        attention 的 c_proj（`...attn.c_proj`），把非 FFN 参数一起数进去。
+        """
+        return sum(p.numel() for n, p in GPT(cfg).named_parameters() if ".mlp." in n)
 
     n_gelu = n_params(gelu_cfg)
     n_swiglu = n_params(swiglu_cfg)
