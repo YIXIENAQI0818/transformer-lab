@@ -10,6 +10,8 @@
     activation: "gelu"（朴素 FFN） | "swiglu"（门控 FFN，见 swiglu.py）
     n_kv_head:  K/V 头数（0 = n_head 即 MHA；2 = GQA，见 gqa.py）
     attn_impl:  "naive"（手写 QKᵀ+softmax） | "flash"（F.scaled_dot_product_attention，见 flash_attn.py）
+    n_expert:   0 = 稠密 FFN；设 n = MoE（n 个 SwiGLU 专家 + router + top-k 稀疏激活，见 moe.py）
+    top_k:      每个 token 激活的专家数（n_expert > 0 时生效）
 
 KV cache 不是 config 开关而是前向参数（见 GPT.forward 的 cache/use_cache），它不改模型结构、
 只改推理时的计算方式，因此不加进 GPTConfig（见 kv_cache.py）。
@@ -24,6 +26,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from rope import apply_rotary_emb, precompute_rope_cache
+from moe import MoE
 
 
 @dataclass
@@ -42,6 +45,8 @@ class GPTConfig:
     activation: str = "gelu"  # "gelu" | "swiglu"（swiglu 是门控结构，替换整个 FFN 而非仅激活函数）
     n_kv_head: int = 0  # K/V 头数：0 = 等于 n_head（MHA）；设 2 = GQA，1 = MQA（K/V 头共享，见 gqa.py）
     attn_impl: str = "naive"  # "naive" | "flash"（注意力实现，见 flash_attn.py）
+    n_expert: int = 0  # 0 = 稠密 FFN；设 n = MoE（n 个 SwiGLU 专家 + router + top-k 稀疏激活，见 moe.py）
+    top_k: int = 2     # 每个 token 激活的专家数（n_expert > 0 时生效）
 
 
 def _build_norm(config: GPTConfig, dim: int):
@@ -191,17 +196,24 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """前馈网络 FFN，按 config.activation 分两种结构。
+    """前馈网络 FFN，按 config.n_expert / config.activation 分三种结构。
 
-    - "gelu"  ：标准 FFN，Linear -> GELU -> Linear，中间维度 4 * n_embd。
-    - "swiglu"：门控 FFN，SwiGLU(x) = down(SiLU(gate(x)) ⊙ up(x))，三个投影，
-                 中间维度 8/3 * n_embd（对齐 4·d FFN 的参数量，见 swiglu.py）。
+    - n_expert=0, "gelu"  ：标准 FFN，Linear -> GELU -> Linear，中间维度 4 * n_embd。
+    - n_expert=0, "swiglu"：门控 FFN，SwiGLU(x) = down(SiLU(gate(x)) ⊙ up(x))，三个投影，
+                            中间维度 8/3 * n_embd（对齐 4·d FFN 的参数量，见 swiglu.py）。
+    - n_expert=n          ：MoE，n 个 SwiGLU 专家 + router + top-k 稀疏激活（见 moe.py）。
+                            专家固定用 SwiGLU（Mixtral / DeepSeek 惯例），与 config.activation 无关。
     """
 
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.activation = config.activation
-        if config.activation == "gelu":
+        self.n_expert = config.n_expert
+        if config.n_expert > 0:
+            # MoE：n 个 SwiGLU 专家 + router，top-k 稀疏激活（专家复用 swiglu.py 的 SwiGLU）
+            self.moe = MoE(config.n_embd, n_expert=config.n_expert,
+                           top_k=config.top_k, bias=config.bias)
+        elif config.activation == "gelu":
             self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
             self.gelu = nn.GELU()
             self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
@@ -217,6 +229,8 @@ class MLP(nn.Module):
         self.dropout = config.dropout
 
     def forward(self, x):
+        if self.n_expert > 0:
+            return F.dropout(self.moe(x), p=self.dropout, training=self.training)
         if self.activation == "gelu":
             x = self.c_fc(x)
             x = self.gelu(x)
@@ -224,6 +238,12 @@ class MLP(nn.Module):
         else:  # swiglu：SwiGLU(x) = down(SiLU(gate(x)) ⊙ up(x))
             x = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
         return F.dropout(x, p=self.dropout, training=self.training)
+
+    def aux_loss(self):
+        """MoE 的负载均衡损失（dense FFN 无路由，返回 0，便于统一累加）。"""
+        if self.n_expert > 0:
+            return self.moe.aux_loss()
+        return torch.zeros((), device=next(self.parameters()).device)
 
 
 class Block(nn.Module):
