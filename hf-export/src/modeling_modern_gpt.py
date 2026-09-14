@@ -62,7 +62,7 @@ class ModernGPTConfig(PretrainedConfig):
     model_type = "modern_gpt"
 
     def __init__(self, vocab_size=256, block_size=256, n_layer=6, n_head=6, n_embd=384,
-                 dropout=0.0, bias=True, n_kv_head=2, n_expert=0, top_k=2, **kwargs):
+                 dropout=0.0, bias=True, n_kv_head=2, n_expert=0, num_experts_per_tok=2, **kwargs):
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.block_size = block_size
@@ -73,7 +73,10 @@ class ModernGPTConfig(PretrainedConfig):
         self.bias = bias
         self.n_kv_head = n_kv_head
         self.n_expert = n_expert
-        self.top_k = top_k
+        # 注意：MoE 的「每 token 专家数」在 byte-bpe 里叫 top_k，但 top_k 是 transformers
+        # generation 的保留字段名（采样的 top-k），撞名会导致 save_pretrained 校验失败，
+        # 故这里改名为 num_experts_per_tok（Mixtral 的标准命名）。
+        self.num_experts_per_tok = num_experts_per_tok
         # transformers 标准字段别名（generate / DynamicCache 等内部逻辑需要）
         self.hidden_size = n_embd
         self.num_hidden_layers = n_layer

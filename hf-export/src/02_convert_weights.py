@@ -25,7 +25,12 @@ def main():
     sd = ckpt["model"]          # 我们的 state_dict（75 个 key）
     cfg = ckpt["config"]        # 我们的超参（字段名与 ModernGPTConfig 完全一致）
 
-    # ---- 构建自定义配置 + 模型（字段直接对齐，无需 char 时代的字段名映射）----
+    # ---- 构建自定义配置 + 模型 ----
+    # 字段名映射只有一处：byte-bpe 的 top_k（MoE 每 token 专家数）-> num_experts_per_tok，
+    # 因为 top_k 是 transformers generation 的保留字段名，撞名会导致校验失败。
+    cfg = dict(cfg)
+    if "top_k" in cfg:
+        cfg["num_experts_per_tok"] = cfg.pop("top_k")
     config = ModernGPTConfig(**cfg)
     model = ModernGPTForCausalLM(config)
 
