@@ -158,6 +158,9 @@ def main():
     parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
 
+    # 让 print 实时刷新（重定向到文件/后台运行时也能看到训练进度，而非攒在缓冲区）
+    sys.stdout.reconfigure(line_buffering=True)
+
     device = (torch.device("cuda" if torch.cuda.is_available() else "cpu")
               if args.device == "auto" else torch.device(args.device))
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out")

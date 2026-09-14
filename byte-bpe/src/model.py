@@ -4,17 +4,16 @@
 固定为现代大模型配置 —— RoPE + RMSNorm + SwiGLU + GQA + FlashAttention，
 仅保留 n_kv_head（GQA 头数）和 n_expert（MoE 专家数）两个模型超参。
 
-去掉的朴素 toggle：
-    pos_enc "learned"（wpe） -> 固定 RoPE
-    norm "layernorm"         -> 固定 RMSNorm
-    activation "gelu"        -> 固定 SwiGLU
-    n_kv_head=0（MHA）       -> n_kv_head 直接是 GQA 头数（1=MQA / 2=GQA / n_head=退化 MHA）
-    attn_impl "naive"        -> 固定 F.scaled_dot_product_attention
+本文件**自包含**：把 rope.py / swiglu.py / moe.py 的实现内联进来（作为工具函数/类），
+不再 import 外部模块。这三个文件仍保留在 src/ 下作为独立教学参考（各自含 __main__ 验证）。
+
+内联的部分：
+  - RoPE  ：precompute_rope_cache / rotate_pairs / apply_rotary_emb（原 rope.py）
+  - SwiGLU：swish / SwiGLU（原 swiglu.py，被 MoE 的专家复用）
+  - MoE   ：load_balancing_loss / MoE（原 moe.py）
 
 保留的行为：KV cache（forward 参数 cache/use_cache）、RoPE 绝对位置 decode、GQA
 repeat_interleave 广播、weight tying、GPT-2 残差缩放初始化、MoE aux_loss。
-
-依赖：rope.py（RoPE）、swiglu.py（SwiGLU，被 moe 间接用）、moe.py（MoE）。
 
 前向：idx (B,T) -> logits (B,T,vocab_size)；给 targets 则返回 (logits, loss)。
 """
@@ -25,8 +24,115 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from rope import apply_rotary_emb, precompute_rope_cache
-from moe import MoE
+
+# ---------------- RoPE（内联自 rope.py） ----------------
+
+def precompute_rope_cache(head_dim, max_seq_len, base=10000.0, device=None, dtype=None):
+    """预计算 RoPE 的 cos / sin 表，shape 均为 (max_seq_len, head_dim)。"""
+    i = torch.arange(0, head_dim // 2, device=device, dtype=dtype)
+    theta = base ** (-2 * i / head_dim)          # (head_dim/2,)
+    m = torch.arange(max_seq_len, device=device, dtype=dtype)
+    angles = torch.outer(m, theta)               # (max_seq_len, head_dim/2)
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+    return cos.repeat_interleave(2, dim=-1), sin.repeat_interleave(2, dim=-1)
+
+
+def rotate_pairs(x):
+    """把相邻分量 pair (x0, x1) 映射为 (-x1, x0)，即绕原点转 90°。"""
+    x0 = x[..., 0::2]
+    x1 = x[..., 1::2]
+    return torch.stack((-x1, x0), dim=-1).flatten(-2)
+
+
+def apply_rotary_emb(x, cos, sin):
+    """x' = x·cos + rotate_pairs(x)·sin。"""
+    return x * cos + rotate_pairs(x) * sin
+
+
+# ---------------- SwiGLU（内联自 swiglu.py） ----------------
+
+def swish(x):
+    """Swish 激活，又名 SiLU：x · sigmoid(x)。"""
+    return x * torch.sigmoid(x)
+
+
+class SwiGLU(nn.Module):
+    """门控 FFN：SwiGLU(x) = down_proj(SiLU(gate_proj(x)) ⊙ up_proj(x))。
+
+    hidden_dim 默认 8/3·dim（对齐标准 4·dim FFN 的参数量）。
+    """
+
+    def __init__(self, dim, hidden_dim=None, bias=True):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = (8 * dim) // 3  # 8/3·d，整数运算避免浮点误差
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=bias)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=bias)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=bias)
+
+    def forward(self, x):
+        return self.down_proj(swish(self.gate_proj(x)) * self.up_proj(x))
+
+
+# ---------------- MoE（内联自 moe.py） ----------------
+
+def load_balancing_loss(logits, topk_idx, n_expert):
+    """Mixtral 式负载均衡损失：鼓励每个专家被选中 / 被路由都均匀。
+
+    loss = n_expert · Σ_e (f_e · P_e)。路由坍缩到单一专家时 loss 大，均匀时最小。
+    """
+    N = logits.size(0)
+    probs = F.softmax(logits, dim=-1)
+    one_hot = F.one_hot(topk_idx, n_expert).float()
+    f_e = one_hot.sum(dim=(0, 1)) / N
+    P_e = probs.mean(dim=0)
+    return n_expert * (f_e * P_e).sum()
+
+
+class MoE(nn.Module):
+    """混合专家 FFN：router 选 top-k 个 SwiGLU 专家，加权求和。
+
+    MoE(x) = Σ_{e ∈ top-k} w_e · SwiGLU_e(x)。稀疏激活动作藏在 sel.any() 里——
+    没被任何 token 选中的专家根本不算，这是 MoE 省算力的来源。
+    """
+
+    def __init__(self, dim, n_expert=4, top_k=2, hidden_dim=None, bias=True):
+        super().__init__()
+        assert 1 <= top_k <= n_expert, f"top_k={top_k} 必须在 [1, n_expert={n_expert}] 内"
+        if hidden_dim is None:
+            hidden_dim = (8 * dim) // 3
+        self.n_expert = n_expert
+        self.top_k = top_k
+        self.router = nn.Linear(dim, n_expert, bias=False)  # d -> n_expert 个得分
+        self.experts = nn.ModuleList([SwiGLU(dim, hidden_dim, bias) for _ in range(n_expert)])
+        self._router_logits = None  # (N, n_expert)
+        self._topk_idx = None       # (N, top_k)
+
+    def forward(self, x):
+        B, T, d = x.shape
+        logits = self.router(x)                            # (B, T, n_expert)
+        probs = F.softmax(logits, dim=-1)
+        topk_weights, topk_idx = torch.topk(probs, self.top_k, dim=-1)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        self._router_logits = logits.reshape(-1, self.n_expert)
+        self._topk_idx = topk_idx.reshape(-1, self.top_k)
+
+        y = torch.zeros_like(x)
+        for i in range(self.top_k):
+            e_idx = topk_idx[..., i]                       # (B, T) 第 i 槽选中的专家编号
+            w = topk_weights[..., i].unsqueeze(-1)         # (B, T, 1)
+            for e in range(self.n_expert):
+                sel = e_idx == e
+                if sel.any():
+                    y[sel] = y[sel] + w[sel] * self.experts[e](x[sel])
+        return y
+
+    def aux_loss(self):
+        """当前 batch 的负载均衡损失（需先 forward 一次）。"""
+        assert self._router_logits is not None, "先 forward 才能取 aux loss"
+        return load_balancing_loss(self._router_logits, self._topk_idx, self.n_expert)
 
 
 @dataclass
@@ -132,7 +238,7 @@ class MLP(nn.Module):
     """前馈网络 FFN：dense SwiGLU（n_expert=0）或 MoE（n_expert=n）。
 
     - dense SwiGLU：gate/up/down 三个投影，中间维度 8/3·d（对齐 4·d FFN 参数量）。
-    - MoE：n 个 SwiGLU 专家 + router + top-k 稀疏激活（见 moe.py）。
+    - MoE：n 个 SwiGLU 专家 + router + top-k 稀疏激活（见上方内联的 MoE 类）。
     """
 
     def __init__(self, config: GPTConfig):
@@ -305,3 +411,12 @@ if __name__ == "__main__":
     logits_dec = torch.cat(logits_dec, dim=1)
     err = (torch.cat([logits_pre, logits_dec], dim=1) - logits_full).abs().max().item()
     print(f"KV cache 一致性: prefill+decode vs full 的 logits 最大误差 = {err:.2e}")
+
+    # MoE smoke test：n_expert>0 时能前向 + aux_loss
+    cfg_moe = GPTConfig(vocab_size=512, block_size=64, n_layer=2, n_head=4, n_embd=128,
+                        n_expert=4, top_k=2)
+    moe_model = GPT(cfg_moe)
+    x = torch.randint(0, cfg_moe.vocab_size, (2, 64))
+    logits_moe, loss_moe = moe_model(x, y)
+    aux = sum(b.mlp.aux_loss() for b in moe_model.transformer.h)
+    print(f"MoE 前向 OK：loss={loss_moe.item():.4f}  aux_loss={aux.item():.4f}")
