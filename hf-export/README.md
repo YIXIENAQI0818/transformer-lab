@@ -1,116 +1,87 @@
-# 把自建 GPT 导出到 HF 标准格式 —— 逐步详解
+# 把自建纯现代 GPT 导出到 HF 标准格式
 
-这个项目回答一个问题：**我们手写训练的 `ckpt.pt`，怎么变成 `AutoModel.from_pretrained` 能加载的标准 HF 模型？**
+回答一个问题：**byte-bpe 训出的纯现代 GPT（RoPE/RMSNorm/SwiGLU/GQA/Flash + BPE），怎么变成 `from_pretrained` 能加载的标准 HF 模型？**
 
-> 部署侧（vLLM / Ollama 等）后续在 llm-lab 里做，本子项目**只做到 HF 格式为止**——因为 HF 格式是「训练/微调 → 部署」整条链的枢纽：训练产 HF、微调产 HF、vLLM 也吃 HF。
+> 本项目是 hf-export 的第二次改造：第一次导出的是 char-level 标准 GPT-2（复用 GPT2LMHeadModel）；这次导出的是 byte-bpe 的纯现代骨架（需自定义建模类）。
 
-## 核心理解：数据 vs 代码
+## 核心理解：数据 vs 代码（不变）
 
-之前几轮讨论澄清了一个贯穿始终的概念：
+模型 = 「数据」+「代码」：
 
-> 模型 = 「数据」 + 「代码」
-> - **数据**：权重（一堆 float 数字）+ 词表（char↔id 映射）
-> - **代码**：模型结构（怎么算 attention）+ tokenizer 算法（怎么 encode/decode）
+- **数据**：权重（float 张量）+ 词表（BPE 的 merges/vocab）
+- **代码**：模型结构（怎么算 attention）+ tokenizer 算法（怎么 encode/decode）
 
-我们的 `ckpt.pt`（数据）+ `model.py`/`tokenizer.py`（代码）都在自己仓库里。transformers 库把「代码」内置得很全、把「数据」格式定得很标准。所以「迁移」的本质，就是把我们的「数据」按 HF 标准存好、把「代码」对应到 transformers 库里已有的实现上。
+迁移的本质：把「数据」按 HF 标准存好、把「代码」对应到 HF 的实现上。
 
-我们的模型结构恰好就是**标准 GPT-2**（阶段 1 照 nanoGPT/GPT-2 写的），所以「结构代码」可以直接复用 transformers 的 `GPT2LMHeadModel`——这就是为什么迁移比想象的简单。
+## 和 char 时代的关键差异
+
+| | char 时代（旧） | byte-bpe 时代（现在） |
+|---|---|---|
+| 模型结构 | 标准 GPT-2 | 纯现代（RoPE/RMSNorm/SwiGLU/GQA/Flash） |
+| 结构代码 | 复用 GPT2LMHeadModel | **自己写 modeling_modern_gpt.py** |
+| 权重迁移 | Conv1D 转置 + attn.bias 剔除等 4 个坑 | **零转换**（参数名一致 + nn.Linear） |
+| tokenizer | char（自定义 PreTrainedTokenizer） | BPE（HF 原生，直接包装） |
+
+**核心权衡**：char 时代结构恰好是标准 GPT-2，所以「代码」复用现成的，但要处理 4 个权重坑；这次结构是纯现代（非标准），所以要「自己写整个建模类」，但换来权重迁移零转换、tokenizer 更简单。
 
 ## 流程概览
 
 ```
-pretraining/out/ckpt.pt          （数据：state_dict + config + meta）
+byte-bpe/out/ckpt.pt + lib_tokenizer.json   （数据）
         │
-        ├── ① 盘点 ── 看清 ckpt 里有什么
+        ├── ① 盘点 ── ckpt 里 model/config（无 meta，tokenizer 单独存）
         │
-        ├── ② 权重迁移 ── 转成 GPT2LMHeadModel + 处理 Conv1D 转置等 4 个坑
+        ├── ② 权重迁移 ── ModernGPTForCausalLM 直接 load_state_dict（零转换）
         │        └─→ out/hf/model.safetensors + config.json
         │
-        ├── ③ tokenizer 迁移 ── stoi/itos → vocab.json + 自定义 PreTrainedTokenizer
-        │        └─→ out/hf/vocab.json + tokenizer_config.json
+        ├── ③ tokenizer 迁移 ── PreTrainedTokenizerFast 包装 → tokenizer.json
+        │        └─→ out/hf/tokenizer.json + tokenizer_config.json
         │
-        └── ④ 验证 ── AutoModel 加载，logits 与原模型逐元素一致
-                 └─→ 标准 HF 格式，可直接被 transformers / vLLM 使用
+        └── ④ 验证 ── logits 与原模型逐元素一致（0.00e+00）
 ```
 
----
+## 关键：建模类 `modeling_modern_gpt.py`
 
-## 步骤① `01_inspect_ckpt.py` —— 盘点 ckpt
+纯现代骨架（RoPE/RMSNorm/SwiGLU/GQA/Flash）在 transformers 里没有现成类，所以自己写：
 
-`torch.save` 存的是一个 dict，含 4 个 key：
+```python
+class ModernGPTConfig(PretrainedConfig):
+    model_type = "modern_gpt"
+    # 字段对齐 byte-bpe 的 GPTConfig（vocab_size / n_layer / n_kv_head / n_expert ...）
 
-| key | 是什么 | 角色 |
-|-----|--------|------|
-| `model` | 所有权重（state_dict，float 张量） | 数据的主体 |
-| `config` | 结构超参（vocab_size/n_layer/n_embd…） | 数据（是「量」不是「逻辑」） |
-| `meta` | tokenizer 词表（stoi/itos） | tokenizer 的数据 |
-| `iter` | 训练步数 | 元信息 |
+class ModernGPTForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = ModernGPTConfig
+    base_model_prefix = "transformer"
+    _tied_weights_keys = {"lm_head.weight": "transformer.wte.weight"}
+    # 内部结构照搬 byte-bpe/src/model.py，参数名完全一致
+```
 
-跑 `python src/01_inspect_ckpt.py`，能看到 `transformer.wte.weight (65,384)`、`transformer.h.0.attn.c_attn.weight (1152,384)` 等 85 个 key。**注意 `c_attn.weight` 是 `(1152,384)`——这是 `nn.Linear` 的 `(out,in)` 布局，后面步骤② 的关键坑就来自这里。**
+**关键设计：参数名与 byte-bpe/src/model.py 完全一致**（`transformer.wte.weight`、`transformer.h.{i}.attn.c_attn.weight`、`transformer.h.{i}.mlp.gate_proj.weight`…），所以 ② 的权重迁移是 `load_state_dict` 直接拷，零转换。
 
----
+## transformers 5.x 踩的坑（这次新增）
 
-## 步骤② `02_convert_weights.py` —— 权重迁移（最核心）
+1. **`_tied_weights_keys` 是 dict 不是 list**：格式 `{tied_key: target_key}`，如 `{"lm_head.weight": "transformer.wte.weight"}`（对比 GPT2 的 `{"lm_head.weight": "transformer.wte.weight"}`）。
+2. **`all_tied_weights_keys` 在 `post_init()` 里设置**：必须调 `self.post_init()`（它会 init_weights + tie_weights + 设置 tied keys），不能只手动 `tie_weights()`。
+3. **`generate` 要显式继承 `GenerationMixin`**：`PreTrainedModel` 本身不带 generate。
+4. **config 要加标准字段别名**：`num_hidden_layers` / `hidden_size` / `num_attention_heads` / `head_dim` 等，generate 内部的 DynamicCache 会读它们（我们的字段叫 `n_layer` / `n_embd` / `n_head`）。
 
-核心结论：**我们的 key 名和 `GPT2LMHeadModel` 几乎完全一致**（因为 nanoGPT 照 GPT-2 写），所以迁移是「逐 key 拷贝 + 处理 4 个坑」：
+## 步骤④ 验证结果
 
-**坑 1：Conv1D vs Linear 转置**
-- 我们的 `nn.Linear(in,out)` 权重存成 `(out,in)`，如 `c_attn.weight (1152,384)`；
-- transformers 的 GPT-2 用 `Conv1D(in,out)`，权重反着存成 `(in,out)`，即 `(384,1152)`。
-- 所以 `c_attn` / `c_proj`(attn) / `c_fc` / `c_proj`(mlp) 共 **24 个权重**要 `.t()` 转置（bias 不用）。
+喂同一段输入，比较原模型（byte-bpe 的 GPT）和 HF 版（ModernGPTForCausalLM）的 logits：
 
-**坑 2：剔除 `attn.bias`** —— 这是 `register_buffer` 存的 causal mask（下三角），GPT-2 不存它，前向时用 `attention_mask` 动态生成。要用 `k.endswith(".attn.bias")` 精确剔除（别误伤 `c_attn.bias`，那是 QKV 投影的 bias）。
+```
+logits 最大绝对误差: 0.00e+00
+✅ logits 逐元素一致 —— 权重迁移 + 结构对齐都正确
+```
 
-**坑 3：token id 越界** —— `GPT2Config` 默认 `bos/eos_token_id=50256`，在 vocab=65 下越界，置 `None` 消除警告。
-
-**坑 4：激活函数对齐** —— nanoGPT 用 `nn.GELU()`（精确 erf 版），GPT-2 默认 `gelu_new`（tanh 近似）。不设 `activation_function="gelu"` 会导致步骤④ 的 logits 对不上。
-
-最后 `save_pretrained(safe_serialization=True)` 存 `model.safetensors` + `config.json`，并用 `strict=False` 检查 `missing/unexpected` 都为空（key 完全对齐）。
-
----
-
-## 步骤③ `03_convert_tokenizer.py` —— tokenizer 迁移
-
-tokenizer 也分「数据 + 代码」：
-- **数据**（stoi/itos 那张 65 条映射）→ 存成 `vocab.json`（JSON 正确转义换行符）；
-- **代码**（encode/decode 逻辑）→ 写成 `HFCharTokenizer`（继承 `PreTrainedTokenizer`，见 `hf_char_tokenizer.py`），实现 `_tokenize`（逐字符）、`_convert_token_to_id`、`convert_tokens_to_string`（直接拼接）。
-
-两个 HF 约定（踩过的坑）：
-1. **`vocab_files_names = {"vocab_file": "vocab.json"}`** + `__init__` 接受 `vocab_file`（文件**路径**）而不是 `vocab`（dict）——`AutoTokenizer` 加载时会把 vocab.json 的路径作为 `vocab_file` 参数传入。
-2. **`auto_map` 格式**是 `["module.ClassName", null]`（`module` 不含 `.py`），让 `AutoTokenizer.from_pretrained(dir, trust_remote_code=True)` 能从我们复制进去的 `hf_char_tokenizer.py` 找到类。
-
----
-
-## 步骤④ `04_verify_hf.py` —— 验证迁移正确
-
-严谨的验证：喂同一段输入，比较**原模型 GPT** 和 **HF 版 GPT2LMHeadModel** 的 logits。
-
-结果：**最大绝对误差 7.63e-06**（< 1e-5），逐元素一致。这证明：权重没丢、Conv1D 转置对、激活函数对齐对——「数据 + 代码」在 HF 侧正确组合了。脚本最后用 `hf_model.generate(...)` 生成一段莎士比亚对白，确认标准格式真的能跑。
-
----
+误差 0 是因为权重零转换（参数名一致、无转置），比 char 时代的 7.63e-06（有 Conv1D 转置的浮点误差）还干净。最后 `hf_model.generate(...)` 生成一段，确认标准格式真的能跑。
 
 ## 之后怎么部署（vLLM）
 
-HF 格式落地后，部署直接走 vLLM（它内部用 transformers 加载，**直接吃 HF 格式**，无需转换）：
+HF 格式落地后，部署走 vLLM（内部用 transformers 加载，直接吃 HF 格式）：
 
 ```bash
-pip install vllm
-vllm serve out/hf        # 起一个 OpenAI 兼容服务，和 Ollama 一样提供 API
+vllm serve out/hf
 ```
 
-这条「transformers 训练 → HF 格式 → vLLM 部署」的链路，后续在 llm-lab 里对大模型微调后同样适用（微调产出也是 HF 格式）。
-
----
-
-## 附：push 到 HuggingFace Hub（可选）
-
-本地已生成标准 HF 格式，如需真实上传：
-
-```bash
-pip install huggingface_hub
-huggingface-cli login
-cd out/hf
-huggingface-cli upload <你的用户名>/my-gpt-shakespeare . .   # 上传整个目录
-```
-
-（本项目按约定不真实 push，仅本地生成 + 验证。）
+（注：vLLM 对自定义架构需要额外的模型注册，本子项目只做到 HF 格式为止。）
