@@ -1,18 +1,18 @@
 """用 byte-level BPE 训练小模型（步骤 05）。
 
 复用 pretraining 的完整训练循环（AdamW + cosine 调度 + 梯度裁剪 + eval + 采样生成），
-tokenizer 用自写 BpeTokenizer（byte-level BPE），模型用纯现代骨架（src/model.py，
-RoPE + RMSNorm + SwiGLU + GQA + FlashAttention）。
+tokenizer 用 tokenizers 库的 ByteLevel BPE，模型用纯现代骨架（src/model.py，
+RoPE + RMSNorm + SwiGLU + GQA + FlashAttention）。自写 BpeTokenizer（src/bpe.py）
+保留作参考，训练直接接入工业库。
 
-时序：先在语料上训好 BPE tokenizer（学出 merge 规则，之后冻结，只做 encode/decode），
-再训模型。ckpt 里同时存 model 权重 + tokenizer meta，生成阶段用 from_meta 重建 tokenizer。
+时序：先用 tokenizers 库训好 BPE tokenizer（学出 merge 规则，之后冻结，只做 encode/decode），
+再训模型。tokenizer 单独存 out/lib_tokenizer.json，ckpt 只存 model 权重 + config。
 
 运行：
   python scripts/train_model.py --max-iters 100   # 小步数验证脚本能跑通
   python scripts/train_model.py                   # 完整训练（GPU ~35min）
 """
 import argparse
-import json
 import math
 import os
 import sys
@@ -24,7 +24,6 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from model import GPT, GPTConfig
-from bpe import BpeTokenizer
 from lib_bpe import LibBpeTokenizer, train_lib_bpe
 from tokenizers import Tokenizer
 
@@ -134,40 +133,20 @@ def make_config(vocab_size):
     )
 
 
-def load_or_train_tokenizer(backend, text, vocab_size, out_dir):
-    """按 backend 加载或训练 BPE tokenizer，返回统一接口（encode/decode/vocab_size）。
-
-    - hand：自写 BpeTokenizer，meta 落盘 out/tokenizer_meta.json，from_meta 加载
-    - lib ：tokenizers 库 ByteLevel BPE，save 落盘 out/lib_tokenizer.json，from_file 加载
-    两者只训一次、之后加载，不重训。
-    """
-    if backend == "hand":
-        path = os.path.join(out_dir, "tokenizer_meta.json")
-        if os.path.exists(path):
-            with open(path) as f:
-                tok = BpeTokenizer.from_meta(json.load(f))
-            print("从 {} 加载已训练的自写 BPE tokenizer（不重训）".format(path))
-        else:
-            print("\n[自写 BPE 训练中...] 语料 {} 字符，目标 vocab {}".format(len(text), vocab_size))
-            t0 = time.time()
-            tok = BpeTokenizer().train(text, vocab_size)
-            with open(path, "w") as f:
-                json.dump(tok.meta, f)
-            print("自写 BPE 训练完成并保存：vocab={}（{} merges），耗时 {:.1f}s -> {}".format(
-                tok.vocab_size, len(tok.merges), time.time() - t0, path))
-    else:  # lib
-        path = os.path.join(out_dir, "lib_tokenizer.json")
-        if os.path.exists(path):
-            tok = LibBpeTokenizer(Tokenizer.from_file(path))
-            print("从 {} 加载已训练的库版 BPE tokenizer（不重训）".format(path))
-        else:
-            print("\n[库版 BPE 训练中...] 语料 {} 字符，目标 vocab {}".format(len(text), vocab_size))
-            t0 = time.time()
-            raw = train_lib_bpe(text, vocab_size)
-            raw.save(path)
-            tok = LibBpeTokenizer(raw)
-            print("库版 BPE 训练完成并保存：vocab={}，耗时 {:.1f}s -> {}".format(
-                tok.vocab_size, time.time() - t0, path))
+def load_or_train_tokenizer(text, vocab_size, out_dir):
+    """加载或训练 tokenizers 库版 BPE（只训一次、之后 from_file 加载，不重训）。"""
+    path = os.path.join(out_dir, "lib_tokenizer.json")
+    if os.path.exists(path):
+        tok = LibBpeTokenizer(Tokenizer.from_file(path))
+        print("从 {} 加载已训练的库版 BPE tokenizer（不重训）".format(path))
+    else:
+        print("\n[库版 BPE 训练中...] 语料 {} 字符，目标 vocab {}".format(len(text), vocab_size))
+        t0 = time.time()
+        raw = train_lib_bpe(text, vocab_size)
+        raw.save(path)
+        tok = LibBpeTokenizer(raw)
+        print("库版 BPE 训练完成并保存：vocab={}，耗时 {:.1f}s -> {}".format(
+            tok.vocab_size, time.time() - t0, path))
     return tok
 
 
@@ -176,8 +155,6 @@ def main():
     parser.add_argument("--max-iters", type=int, default=5000,
                         help="训练步数（默认 5000；先小步数验证可传 100）")
     parser.add_argument("--vocab-size", type=int, default=512, help="BPE 目标词表")
-    parser.add_argument("--tokenizer", choices=["hand", "lib"], default="hand",
-                        help="tokenizer 后端：hand=自写 BPE，lib=tokenizers 库 ByteLevel")
     parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
 
@@ -196,8 +173,8 @@ def main():
         device, "TinyShakespeare" if os.path.exists(data_path) else "合成", len(text)))
     print("=" * 66)
 
-    # ---- BPE tokenizer：只训一次、之后加载（hand=自写 / lib=tokenizers 库）----
-    tok = load_or_train_tokenizer(args.tokenizer, text, args.vocab_size, out_dir)
+    # ---- BPE tokenizer（tokenizers 库）：只训一次、之后加载 ----
+    tok = load_or_train_tokenizer(text, args.vocab_size, out_dir)
 
     n_tokens = len(tok.encode(text))
     print("压缩比：{} 字符 -> {} token（{:.2f}x）".format(
@@ -245,11 +222,10 @@ def main():
             print(sample(model, tok, device))
             print("--------------")
 
-    # ---- 保存 ckpt（model 权重 + tokenizer meta，生成阶段 from_meta 重建）----
+    # ---- 保存 ckpt（tokenizer 已单独存 lib_tokenizer.json，ckpt 只存 model + config）----
     ckpt = {
         "model": model.state_dict(),
         "config": asdict(config),
-        "tokenizer_meta": tok.meta,
         "iter": args.max_iters,
     }
     ckpt_path = os.path.join(out_dir, "ckpt.pt")
