@@ -1,7 +1,7 @@
 """步骤 1：看清 model-tokenizer ckpt 里有什么。
 
 ckpt 里存「数据」：model（state_dict）+ config（超参）+ iter。tokenizer 不在 ckpt 里，
-单独存 model-tokenizer/out/lib_tokenizer.json（tokenizers 库格式）。
+单独存 model-tokenizer/out/train/lib_tokenizer.json（tokenizers 库格式）。
 
 「代码」不在 ckpt 里：模型结构在 model-tokenizer/src/model.py（纯现代骨架），tokenizer 算法在
 tokenizers 库。这正是迁移的起点——把数据按 HF 标准存好、代码对应到 HF 的实现。
@@ -15,7 +15,7 @@ import torch
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))          # model-tokenizer/scripts-export
 PROJ_DIR = os.path.dirname(SRC_DIR)                           # model-tokenizer
 LAB_DIR = os.path.dirname(PROJ_DIR)                           # transformer-lab
-CKPT_PATH = os.path.join(PROJ_DIR, "out", "ckpt.pt")
+CKPT_PATH = os.path.join(PROJ_DIR, "out", "train", "ckpt.pt")
 
 
 def main():
@@ -25,7 +25,7 @@ def main():
     print("① ckpt 顶层 key")
     print("=" * 66)
     print("  ", list(ckpt.keys()))
-    print("   （注意：没有 meta——tokenizer 单独存 model-tokenizer/out/lib_tokenizer.json）")
+    print("   （注意：没有 meta——tokenizer 单独存 model-tokenizer/out/train/lib_tokenizer.json）")
     print()
 
     print("=" * 66)

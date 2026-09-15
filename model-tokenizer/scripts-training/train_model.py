@@ -6,7 +6,7 @@ RoPE + RMSNorm + SwiGLU + GQA + FlashAttention）。自写 BpeTokenizer（src/bp
 保留作参考，训练直接接入工业库。
 
 时序：先用 tokenizers 库训好 BPE tokenizer（学出 merge 规则，之后冻结，只做 encode/decode），
-再训模型。tokenizer 单独存 out/lib_tokenizer.json，ckpt 只存 model 权重 + config。
+再训模型。tokenizer 单独存 out/train/lib_tokenizer.json，ckpt 只存 model 权重 + config。
 
 运行：
   python scripts/train_model.py --max-iters 100   # 小步数验证脚本能跑通
@@ -24,8 +24,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from model import GPT, GPTConfig
-from lib_bpe import LibBpeTokenizer, train_lib_bpe
-from tokenizers import Tokenizer
+from lib_bpe import train_lib_bpe, load_lib_bpe
 
 # ---------------- 超参（对齐 model-core 的完整训练规模） ----------------
 BATCH_SIZE = 64
@@ -137,14 +136,12 @@ def load_or_train_tokenizer(text, vocab_size, out_dir):
     """加载或训练 tokenizers 库版 BPE（只训一次、之后 from_file 加载，不重训）。"""
     path = os.path.join(out_dir, "lib_tokenizer.json")
     if os.path.exists(path):
-        tok = LibBpeTokenizer(Tokenizer.from_file(path))
+        tok = load_lib_bpe(path)
         print("从 {} 加载已训练的库版 BPE tokenizer（不重训）".format(path))
     else:
         print("\n[库版 BPE 训练中...] 语料 {} 字符，目标 vocab {}".format(len(text), vocab_size))
         t0 = time.time()
-        raw = train_lib_bpe(text, vocab_size)
-        raw.save(path)
-        tok = LibBpeTokenizer(raw)
+        tok = train_lib_bpe(text, vocab_size, save_path=path)
         print("库版 BPE 训练完成并保存：vocab={}，耗时 {:.1f}s -> {}".format(
             tok.vocab_size, time.time() - t0, path))
     return tok
@@ -163,7 +160,7 @@ def main():
 
     device = (torch.device("cuda" if torch.cuda.is_available() else "cpu")
               if args.device == "auto" else torch.device(args.device))
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out")
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out", "train")
     os.makedirs(out_dir, exist_ok=True)
 
     data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),

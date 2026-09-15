@@ -4,13 +4,13 @@
 固定为现代大模型配置 —— RoPE + RMSNorm + SwiGLU + GQA + FlashAttention，
 仅保留 n_kv_head（GQA 头数）和 n_expert（MoE 专家数）两个模型超参。
 
-本文件**自包含**：把 rope.py / swiglu.py / moe.py 的实现内联进来（作为工具函数/类），
-不再 import 外部模块。这三个文件仍保留在 src/ 下作为独立教学参考（各自含 __main__ 验证）。
+本文件**自包含**：把 RoPE / SwiGLU / MoE 的实现内联进来（作为工具函数/类），
+不再 import 外部模块（对应 model-upgrade/src/components/ 下的 rope / swiglu / moe）。
 
 内联的部分：
-  - RoPE  ：precompute_rope_cache / rotate_pairs / apply_rotary_emb（原 rope.py）
-  - SwiGLU：swish / SwiGLU（原 swiglu.py，被 MoE 的专家复用）
-  - MoE   ：load_balancing_loss / MoE（原 moe.py）
+  - RoPE  ：precompute_rope_cache / rotate_pairs / apply_rotary_emb
+  - SwiGLU：swish / SwiGLU（被 MoE 的专家复用）
+  - MoE   ：load_balancing_loss / MoE
 
 保留的行为：KV cache（forward 参数 cache/use_cache）、RoPE 绝对位置 decode、GQA
 repeat_interleave 广播、weight tying、GPT-2 残差缩放初始化、MoE aux_loss。
@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
-# ---------------- RoPE（内联自 rope.py） ----------------
+# ---------------- RoPE（内联实现） ----------------
 
 def precompute_rope_cache(head_dim, max_seq_len, base=10000.0, device=None, dtype=None):
     """预计算 RoPE 的 cos / sin 表，shape 均为 (max_seq_len, head_dim)。"""
@@ -50,7 +50,7 @@ def apply_rotary_emb(x, cos, sin):
     return x * cos + rotate_pairs(x) * sin
 
 
-# ---------------- SwiGLU（内联自 swiglu.py） ----------------
+# ---------------- SwiGLU（内联实现） ----------------
 
 def swish(x):
     """Swish 激活，又名 SiLU：x · sigmoid(x)。"""
@@ -75,7 +75,7 @@ class SwiGLU(nn.Module):
         return self.down_proj(swish(self.gate_proj(x)) * self.up_proj(x))
 
 
-# ---------------- MoE（内联自 moe.py） ----------------
+# ---------------- MoE（内联实现） ----------------
 
 def load_balancing_loss(logits, topk_idx, n_expert):
     """Mixtral 式负载均衡损失：鼓励每个专家被选中 / 被路由都均匀。

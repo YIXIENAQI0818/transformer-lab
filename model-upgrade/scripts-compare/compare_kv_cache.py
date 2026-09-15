@@ -11,7 +11,7 @@
 本脚本与前面回合的「mini 训练对比」不同——KV cache 不影响训练、不改变 loss，所以不做训练，
 直接用一个随机初始化的模型验证「两条走法 logits 逐 token 一致 + 计时差异 + 张量走法」。
 
-运行：python scripts/compare_kv_cache.py [--block-size B] [--new-tokens N] [--prompt-len P] [--data PATH]
+运行：python scripts-compare/compare_kv_cache.py [--block-size B] [--new-tokens N] [--prompt-len P] [--data PATH]
 """
 import argparse
 import math
@@ -21,7 +21,7 @@ import time
 
 import torch
 
-# 让脚本能从 scripts/ 直接 import src/ 里的 model（scripts/ 与 src/ 同层）
+# 让脚本能从 scripts-compare/ 直接 import src/ 里的 model（scripts-compare/ 与 src/ 同层）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from model import GPT, GPTConfig

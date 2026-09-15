@@ -25,8 +25,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from rope import apply_rotary_emb, precompute_rope_cache
-from moe import MoE
+from components.rope import apply_rotary_emb, precompute_rope_cache
+from components.moe import MoE
 
 
 @dataclass

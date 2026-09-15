@@ -16,8 +16,8 @@ import torch
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))          # model-tokenizer/scripts-export
 PROJ_DIR = os.path.dirname(SRC_DIR)                           # model-tokenizer
 LAB_DIR = os.path.dirname(PROJ_DIR)                           # transformer-lab
-CKPT_PATH = os.path.join(PROJ_DIR, "out", "ckpt.pt")
-OUT_HF = os.path.join(PROJ_DIR, "out", "hf")
+CKPT_PATH = os.path.join(PROJ_DIR, "out", "train", "ckpt.pt")
+OUT_HF = os.path.join(PROJ_DIR, "out", "export", "hf")
 
 # import 原始模型（model-tokenizer/src/model.py）
 sys.path.insert(0, os.path.join(PROJ_DIR, "src"))

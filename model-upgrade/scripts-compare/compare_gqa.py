@@ -1,10 +1,11 @@
-"""回合 03 对比：GELU FFN vs SwiGLU（门控）。
+"""回合 04 对比：MHA vs GQA（K/V 头共享）。
 
-在相同数据 / 相同种子下各训练一个只有 FFN 结构不同的小 GPT，对比 loss 曲线与参数量。
-关键点：SwiGLU 中间维度取 8/3·d 使总参数量与标准 4·d FFN 对齐，这样 loss 差异只能归因于
-「门控结构 vs 单一激活」，而非参数更多（对齐验证见 src/swiglu.py 的 __main__）。
+在相同数据 / 相同种子下各训练一个只有注意力 K/V 头数不同的小 GPT，对比 loss 曲线、
+参数量与 KV cache 大小。GQA（n_kv_head=2）让 2 个 Q 头共享 1 个 K/V 头，省 K/V 投影参数 +
+KV cache 减半，且 loss 几乎不掉（KV cache 的详细张量走法是回合 06 主题，这里先看「每 token
+K/V 元素数」这个伏笔）。
 
-运行：python scripts/compare_swiglu.py [--steps N] [--block-size B] [--batch-size M] [--data PATH]
+运行：python scripts-compare/compare_gqa.py [--steps N] [--block-size B] [--batch-size M] [--data PATH]
 """
 import argparse
 import os
@@ -12,13 +13,13 @@ import sys
 
 import torch
 
-# 让脚本能从 scripts/ 直接 import src/ 里的 model（scripts/ 与 src/ 同层）
+# 让脚本能从 scripts-compare/ 直接 import src/ 里的 model（scripts-compare/ 与 src/ 同层）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from model import GPT, GPTConfig
 
 
-# ---------- 数据 ----------（与 compare_rope.py / compare_rmsnorm.py 相同）
+# ---------- 数据 ----------（与前几回合相同）
 
 def load_text(path):
     """读训练文本；路径不存在时回退到合成数据（保证脚本可独立跑通）。"""
@@ -65,8 +66,8 @@ def estimate_loss(model, data, block_size, batch_size, device, eval_iters=20):
     return losses.mean().item()
 
 
-def train_one(activation, data, config, steps, batch_size, device):
-    """训练一个指定 FFN 结构的小 GPT，返回 (model, [(step, train_loss, val_loss), ...])。"""
+def train_one(label, data, config, steps, batch_size, device):
+    """训练一个指定 K/V 头数的小 GPT，返回 (model, [(step, train_loss, val_loss), ...])。"""
     torch.manual_seed(1337)
     model = GPT(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -81,8 +82,8 @@ def train_one(activation, data, config, steps, batch_size, device):
         if step % 50 == 0 or step == steps - 1:
             val = estimate_loss(model, data, config.block_size, batch_size, device)
             history.append((step, loss.item(), val))
-            print("    [{:6s}] step {:4d}: train {:.4f}  val {:.4f}".format(
-                activation, step, loss.item(), val))
+            print("    [{:5s}] step {:4d}: train {:.4f}  val {:.4f}".format(
+                label, step, loss.item(), val))
     return model, history
 
 
@@ -109,52 +110,50 @@ def main():
     vocab_size = len(stoi)
     data = torch.tensor(encode(text, stoi), dtype=torch.long)
 
-    # 沿用前两回合已升级的底座：RoPE + RMSNorm，本回合只变 FFN
+    # 沿用前三回合已升级底座：RoPE + RMSNorm + SwiGLU，本回合只变 K/V 头数
     base_cfg = dict(block_size=args.block_size, vocab_size=vocab_size,
-                    n_layer=4, n_head=4, n_embd=128, pos_enc="rope", norm="rmsnorm")
-    gelu_cfg = GPTConfig(**base_cfg, activation="gelu")
-    swiglu_cfg = GPTConfig(**base_cfg, activation="swiglu")
+                    n_layer=4, n_head=4, n_embd=128, pos_enc="rope", norm="rmsnorm", activation="swiglu")
+    mha_cfg = GPTConfig(**base_cfg, n_kv_head=4)   # MHA
+    gqa_cfg = GPTConfig(**base_cfg, n_kv_head=2)   # GQA
 
     def n_params(cfg):
         return sum(p.numel() for p in GPT(cfg).parameters())
 
-    def n_ffn_params(cfg):
-        """只数 FFN 子层的参数量，展示 8/3·d 对齐的关键。
+    n_mha = n_params(mha_cfg)
+    n_gqa = n_params(gqa_cfg)
 
-        用 ".mlp." 精确匹配 FFN 子模块；注意不能用 "c_proj" 子串——它会同时命中
-        attention 的 c_proj（`...attn.c_proj`），把非 FFN 参数一起数进去。
-        """
-        return sum(p.numel() for n, p in GPT(cfg).named_parameters() if ".mlp." in n)
+    n_head, head_size = 4, 128 // 4
 
-    n_gelu = n_params(gelu_cfg)
-    n_swiglu = n_params(swiglu_cfg)
+    def kv_cache_size(n_kv_head):
+        """每 token 的 K/V 元素数（K + V 各 n_kv_head 个头 × head_size）。"""
+        return 2 * n_kv_head * head_size
 
     print("=" * 62)
-    print("回合 03：GELU FFN vs SwiGLU（门控）")
+    print("回合 04：MHA vs GQA（K/V 头共享）")
     print("设备: {}  数据: {}".format(device, data_path if os.path.exists(data_path) else "（合成）"))
-    print("vocab={}  block_size={}  batch={}  steps={}".format(
-        vocab_size, args.block_size, args.batch_size, args.steps))
-    print("总参数: gelu={}  swiglu={}  （差 {}，来自 8/3 取整）".format(
-        n_gelu, n_swiglu, n_swiglu - n_gelu))
-    print("FFN 参数: gelu={}  swiglu={}  （8/3·d 对齐了 FFN 参数量）".format(
-        n_ffn_params(gelu_cfg), n_ffn_params(swiglu_cfg)))
+    print("vocab={}  block_size={}  batch={}  steps={}  n_head={}".format(
+        vocab_size, args.block_size, args.batch_size, args.steps, n_head))
+    print("总参数: mha={}  gqa={}  （GQA 省 {} = K/V 投影）".format(
+        n_mha, n_gqa, n_mha - n_gqa))
+    print("KV cache: mha={} 元素/token  gqa={} 元素/token  （GQA 减半）".format(
+        kv_cache_size(4), kv_cache_size(2)))
     print("=" * 62)
 
-    print("\n[训练 gelu]")
-    _, hist_gelu = train_one("gelu", data, gelu_cfg, args.steps, args.batch_size, device)
-    print("\n[训练 swiglu]")
-    _, hist_swiglu = train_one("swiglu", data, swiglu_cfg, args.steps, args.batch_size, device)
+    print("\n[训练 mha]")
+    _, hist_mha = train_one("mha", data, mha_cfg, args.steps, args.batch_size, device)
+    print("\n[训练 gqa]")
+    _, hist_gqa = train_one("gqa", data, gqa_cfg, args.steps, args.batch_size, device)
 
-    print("\n=== loss 对比（step: gelu_tr/va  vs  swiglu_tr/va）===")
-    print("{:>6} {:>12} {:>12} {:>12} {:>12}".format("step", "gelu_tr", "gelu_va", "swiglu_tr", "swiglu_va"))
-    for (s1, ltr, lva), (s2, rtr, rva) in zip(hist_gelu, hist_swiglu):
+    print("\n=== loss 对比（step: mha_tr/va  vs  gqa_tr/va）===")
+    print("{:>6} {:>12} {:>12} {:>12} {:>12}".format("step", "mha_tr", "mha_va", "gqa_tr", "gqa_va"))
+    for (s1, ltr, lva), (s2, rtr, rva) in zip(hist_mha, hist_gqa):
         print("{:6d} {:12.4f} {:12.4f} {:12.4f} {:12.4f}".format(s1, ltr, lva, rtr, rva))
 
     print("\n结论:")
-    print("  - SwiGLU 用门控（可学习的 gate 决定 value 每维放行多少）替代 GELU 的固定开关。")
-    print("  - 中间维度 8/3·d 使 FFN 参数量对齐（{} vs {}），loss 差异只能归因于门控结构。".format(
-        n_ffn_params(gelu_cfg), n_ffn_params(swiglu_cfg)))
-    print("  - 等参数下 SwiGLU 的 loss 相当或更低 —— 这正是现代大模型全用 SwiGLU 的原因。")
+    print("  - GQA 让多个 Q 头共享 K/V 头（n_kv_head=2），省 K/V 投影参数（{} 参数）。".format(n_mha - n_gqa))
+    print("  - KV cache 每 token 从 {} 降到 {} 元素（减半），decode 省显存 + 更快。".format(
+        kv_cache_size(4), kv_cache_size(2)))
+    print("  - GQA 的 loss 与 MHA 相当（K/V 头冗余被共享掉，几乎无损）——这正是现代大模型全用 GQA 的原因。")
 
 
 if __name__ == "__main__":

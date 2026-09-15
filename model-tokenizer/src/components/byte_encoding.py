@@ -8,7 +8,7 @@ byte-level BPE 的「byte-level」层：在字节（0~255 闭集）层面操作�
 词表 = 训练数据里出现过的字符，推理时遇到训练集外的字符（中文 / emoji / 罕见符号）
 直接 KeyError（OOV）。byte-level 用「256 个字节兜底」解决这个问题。
 
-运行：python src/byte_encoding.py
+运行：python -m src.components.byte_encoding
 """
 
 

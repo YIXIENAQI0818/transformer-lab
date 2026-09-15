@@ -32,8 +32,8 @@ import math
 import torch
 import torch.nn.functional as F
 
-from gqa import repeat_kv
-from rope import apply_rotary_emb, precompute_rope_cache
+from .gqa import repeat_kv
+from .rope import apply_rotary_emb, precompute_rope_cache
 
 
 class KVCache:

@@ -1,7 +1,7 @@
-"""从 ckpt 加载模型采样生成（阶段 2）。
+"""从 ckpt 加载模型采样生成（byte-level BPE 模型）。
 
-用法（从 model-core/ 目录）：
-    python scripts-training/generate.py --ckpt out/train/ckpt.pt --prompt "ROMEO:" --max_new_tokens 500
+用法（从 model-tokenizer/ 目录）：
+    python scripts-training/generate.py --prompt "ROMEO:" --max_new_tokens 500
 """
 import argparse
 import os
@@ -11,14 +11,17 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 from model import GPT, GPTConfig
-from tokenizer import CharTokenizer
+from lib_bpe import load_lib_bpe
 
-DEFAULT_CKPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out", "train", "ckpt.pt")
+PROJ_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # model-tokenizer
+DEFAULT_CKPT = os.path.join(PROJ_DIR, "out", "train", "ckpt.pt")
+DEFAULT_TOK = os.path.join(PROJ_DIR, "out", "train", "lib_tokenizer.json")
 
 
 def main():
     parser = argparse.ArgumentParser(description="从训练好的 ckpt 采样生成文本")
     parser.add_argument("--ckpt", type=str, default=DEFAULT_CKPT)
+    parser.add_argument("--tokenizer", type=str, default=DEFAULT_TOK)
     parser.add_argument("--prompt", type=str, default="\n", help='起始文本，如 "ROMEO:"')
     parser.add_argument("--max_new_tokens", type=int, default=500)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -34,7 +37,7 @@ def main():
     model = GPT(config).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
-    tok = CharTokenizer.from_meta(ckpt["meta"])
+    tok = load_lib_bpe(args.tokenizer)
 
     idx = torch.tensor([tok.encode(args.prompt)], dtype=torch.long, device=device)
     gen = model.generate(

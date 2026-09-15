@@ -1,11 +1,10 @@
-"""预训练训练循环（阶段 2）。
+"""训练「组件升级后」的模型（现代组件全开）。
 
-用 char-level tokenizer 在 TinyShakespeare 上训练 decoder-only GPT，
-跑通「数据 -> tokenizer -> 模型 -> 训练 -> 生成」全流程。
+用 char-level tokenizer 在 TinyShakespeare 上训练可配置骨架的现代配置
+（RoPE + RMSNorm + SwiGLU + GQA + FlashAttention），得到升级后的最终模型。
+与 model-core 的朴素 GPT-2 同数据同规模，只把模型换成现代组件。
 
-超参对齐 nanoGPT config/train_shakespeare_char.py（备选见文件底部注释）。
-
-运行（从 model-core/ 目录）：python scripts-training/train.py
+运行（从 model-upgrade/ 目录）：python scripts-training/train.py
 """
 import math
 import os
@@ -19,12 +18,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from model import GPT, GPTConfig
 from tokenizer import CharTokenizer
 
-# ---------------- 超参（nanoGPT shakespeare_char，备选见底部） ----------------
+# ---------------- 超参（对齐 model-core 的完整训练规模） ----------------
 BATCH_SIZE = 64
 BLOCK_SIZE = 256
 N_LAYER = 6
 N_HEAD = 6
 N_EMBD = 384
+N_KV_HEAD = 2          # 回合04 GQA：K/V 头共享
 DROPOUT = 0.2
 
 LEARNING_RATE = 1e-3
@@ -110,9 +110,25 @@ def sample(model, tok, max_new_tokens=GEN_TOKENS):
     """从换行符起始生成一段文本，观察训练过程中输出从乱码变通顺。"""
     model.eval()
     idx = torch.tensor([tok.encode("\n")], dtype=torch.long, device=DEVICE)
-    gen = model.generate(idx, max_new_tokens=max_new_tokens)
+    gen = _generate(model, idx, max_new_tokens)
     model.train()
     return tok.decode(gen[0].tolist())
+
+
+@torch.no_grad()
+def _generate(model, idx, max_new_tokens, temperature=1.0, top_k=None):
+    """KV cache 自回归采样（prefill 一次 + 逐步 decode），返回完整 token 序列 (1, T)。"""
+    logits, cache = model(idx, use_cache=True)          # prefill：并行算整段 prompt
+    for _ in range(max_new_tokens):
+        logit = logits[:, -1, :] / temperature         # 末位 logits
+        if top_k is not None:
+            v, _ = torch.topk(logit, min(top_k, logit.size(-1)))
+            logit[logit < v[:, [-1]]] = -float("Inf")
+        probs = torch.softmax(logit, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)   # (1, 1)
+        idx = torch.cat([idx, next_token], dim=1)
+        logits, cache = model(next_token, cache=cache)  # decode：复用 cache 只算新 token
+    return idx
 
 
 def main():
@@ -126,16 +142,17 @@ def main():
     config = GPTConfig(
         vocab_size=tok.vocab_size, block_size=BLOCK_SIZE,
         n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD, dropout=DROPOUT,
+        pos_enc="rope", norm="rmsnorm", activation="swiglu",
+        n_kv_head=N_KV_HEAD, attn_impl="flash",
     )
     model = GPT(config).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"参数量 {n_params / 1e6:.2f}M")
+    print(f"参数量 {n_params / 1e6:.2f}M（现代组件：RoPE/RMSNorm/SwiGLU/GQA/FlashAttention）")
 
     optimizer = configure_optimizers(model)
     t0 = time.time()
 
     for it in range(MAX_ITERS):
-        # 按调度器更新 lr
         lr = get_lr(it)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
@@ -165,8 +182,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# ---- 备选超参 ----
-# 更大的模型（nanoGPT gpt2-small）：n_layer=12, n_head=12, n_embd=768, lr=6e-4,
-#   max_iters=600000, batch_size=12, block_size=1024（显存/时间开销大幅增加）。
-# 想更快验证：把 MAX_ITERS 调到 500~1000，EVAL_INTERVAL 同步缩小。

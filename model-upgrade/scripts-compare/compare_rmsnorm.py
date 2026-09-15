@@ -3,7 +3,7 @@
 在相同数据 / 相同种子下各训练一个只有归一化层不同的小 GPT，对比 loss 曲线与参数量；
 再对归一化层本身做一次孤立计时（少一次归约、速度收益个位数；手写分步版慢 3 倍，需 fuse）。
 
-运行：python scripts/compare_rmsnorm.py [--steps N] [--block-size B] [--batch-size M] [--data PATH]
+运行：python scripts-compare/compare_rmsnorm.py [--steps N] [--block-size B] [--batch-size M] [--data PATH]
 """
 import argparse
 import os
@@ -13,11 +13,11 @@ import time
 import torch
 import torch.nn as nn
 
-# 让脚本能从 scripts/ 直接 import src/ 里的 model / rmsnorm（scripts/ 与 src/ 同层）
+# 让脚本能从 scripts-compare/ 直接 import src/ 里的 model / rmsnorm（scripts-compare/ 与 src/ 同层）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from model import GPT, GPTConfig
-from rmsnorm import RMSNorm
+from components.rmsnorm import RMSNorm
 
 
 # ---------- 数据 ----------（与 compare_rope.py 相同，见其注释）

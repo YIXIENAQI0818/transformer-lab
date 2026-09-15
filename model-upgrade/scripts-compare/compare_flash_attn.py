@@ -8,7 +8,7 @@ fused sdpa / 手写 tiling 三者）和显存元素数对比，看清收益在�
 和速度（GPU 上 fused kernel 省掉 HBM 往返）。手写 Python 版 tiling 反而最慢——加速来自
 CUDA fused kernel，而非「分块」这个想法本身。
 
-运行：python scripts/compare_flash_attn.py [--steps N] [--block-size B] [--batch-size M] [--data PATH] [--bench-t T]
+运行：python scripts-compare/compare_flash_attn.py [--steps N] [--block-size B] [--batch-size M] [--data PATH] [--bench-t T]
 """
 import argparse
 import math
@@ -19,11 +19,11 @@ import time
 import torch
 import torch.nn.functional as F
 
-# 让脚本能从 scripts/ 直接 import src/ 里的 model / flash_attn（scripts/ 与 src/ 同层）
+# 让脚本能从 scripts-compare/ 直接 import src/ 里的 model / flash_attn（scripts-compare/ 与 src/ 同层）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from model import GPT, GPTConfig
-from flash_attn import flash_attention
+from components.flash_attn import flash_attention
 
 
 # ---------- 数据 ----------（与前几回合相同）

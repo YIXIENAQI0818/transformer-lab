@@ -11,9 +11,10 @@
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 
 
-def train_lib_bpe(text, vocab_size):
-    """用 tokenizers 库训练 byte-level BPE，返回训练好的 Tokenizer。
+def train_lib_bpe(text, vocab_size, save_path=None):
+    """用 tokenizers 库训练 byte-level BPE，返回包装好的 LibBpeTokenizer。
 
+    若给定 save_path，训练完把官方 Tokenizer 存成 json（之后 load_lib_bpe 加载）。
     initial_alphabet 显式设为全部 256 个字节字符，与自写版的「256 字节兜底」对齐。
     """
     tok = Tokenizer(models.BPE(unk_token=None))
@@ -25,7 +26,9 @@ def train_lib_bpe(text, vocab_size):
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
     tok.train_from_iterator([text], trainer=trainer)
-    return tok
+    if save_path is not None:
+        tok.save(save_path)
+    return LibBpeTokenizer(tok)
 
 
 class LibBpeTokenizer:
@@ -47,3 +50,12 @@ class LibBpeTokenizer:
 
     def decode(self, ids):
         return self._tok.decode(ids)
+
+
+def load_lib_bpe(path):
+    """从 json 加载已训练的库版 BPE tokenizer，包装成统一接口。
+
+    和 train_lib_bpe（训练）+ LibBpeTokenizer（包装）一起，把「训练 / 加载 / 包装」
+    全部收在 lib_bpe 内部，训练脚本只 import lib_bpe，不直接碰官方 tokenizers 库。
+    """
+    return LibBpeTokenizer(Tokenizer.from_file(path))

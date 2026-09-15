@@ -37,8 +37,8 @@ from transformers import GPT2Config, GPT2LMHeadModel
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))          # model-core/scripts-export
 PROJ_DIR = os.path.dirname(SRC_DIR)                           # model-core
 LAB_DIR = os.path.dirname(PROJ_DIR)                           # transformer-lab
-CKPT_PATH = os.path.join(PROJ_DIR, "out", "ckpt.pt")
-OUT_HF = os.path.join(PROJ_DIR, "out", "hf")
+CKPT_PATH = os.path.join(PROJ_DIR, "out", "train", "ckpt.pt")
+OUT_HF = os.path.join(PROJ_DIR, "out", "export", "hf")
 
 # 需要转置的权重后缀：这些层在我们这边是 nn.Linear，GPT-2 那边是 Conv1D
 TRANSPOSE_SUFFIX = (

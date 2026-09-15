@@ -29,7 +29,7 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
-# ---------------- RoPE（内联，照搬 model-tokenizer/src/rope.py） ----------------
+# ---------------- RoPE（内联，照搬 model-tokenizer/src/model.py） ----------------
 
 def precompute_rope_cache(head_dim, max_seq_len, base=10000.0, device=None, dtype=None):
     """预计算 RoPE 的 cos/sin 表，shape (max_seq_len, head_dim)。"""
@@ -60,6 +60,9 @@ class ModernGPTConfig(PretrainedConfig):
     """纯现代骨架的 HF 配置类，字段对齐 model-tokenizer 的 GPTConfig。"""
 
     model_type = "modern_gpt"
+    # 让 config.save_pretrained 自动写 auto_map["AutoConfig"]，AutoConfig.from_pretrained
+    # (trust_remote_code=True) 才能识别这个自定义配置类。
+    _auto_class = "AutoConfig"
 
     def __init__(self, vocab_size=256, block_size=256, n_layer=6, n_head=6, n_embd=384,
                  dropout=0.0, bias=True, n_kv_head=2, n_expert=0, num_experts_per_tok=2, **kwargs):
@@ -173,6 +176,9 @@ class ModernGPTForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = ModernGPTConfig
     base_model_prefix = "transformer"
     _tied_weights_keys = {"lm_head.weight": "transformer.wte.weight"}
+    # _auto_class 标记本模型对应哪个 Auto 类：save_pretrained 时据此触发 custom_object_save，
+    # 自动把 modeling_modern_gpt.py 复制进产物目录 + 在 config 里写 auto_map（别人 trust_remote_code 加载）。
+    _auto_class = "AutoModelForCausalLM"
 
     def __init__(self, config):
         super().__init__(config)

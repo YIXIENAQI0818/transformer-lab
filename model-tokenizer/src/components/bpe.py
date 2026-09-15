@@ -17,9 +17,9 @@
 映射（bytes_to_unicode），本文件为了教学清晰直接在原始字节 id 上做，两者语义一致、token id 不同，
 差异详见 scripts/compare_tokenizers.py。
 
-运行：python src/bpe.py
+运行：python -m src.components.bpe
 """
-from byte_encoding import text_to_bytes
+from .byte_encoding import text_to_bytes
 
 
 def _get_stats(ids):

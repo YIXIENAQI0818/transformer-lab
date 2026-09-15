@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from swiglu import SwiGLU
+from .swiglu import SwiGLU
 
 
 def load_balancing_loss(logits, topk_idx, n_expert):

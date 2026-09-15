@@ -15,7 +15,7 @@ byte-level BPE，和手写版对照，验证手写实现的语义正确。
   GPT-2 的 byte->unicode 映射（把不可打印字节换成可打印 unicode 字符），再在这些字符上做
   BPE。两者数学语义一致、token 表示不同，故对照时把库的 token 反映射回字节再比。
 
-运行：python scripts/compare_tokenizers.py [--max-chars N] [--vocab-size V]
+运行：python scripts-compare/compare_tokenizers.py [--max-chars N] [--vocab-size V]
 """
 import argparse
 import os
@@ -23,7 +23,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from bpe import BpeTokenizer
+from components.bpe import BpeTokenizer
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 
 

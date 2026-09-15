@@ -4,7 +4,7 @@
 严谨的验证方法：喂同一段输入，比较两个模型的 logits，应该逐元素一致（误差 < 1e-5）。
 
   - 原始模型：model-core/src/model.py 的 GPT（我们手写的结构代码）
-  - HF 版模型：AutoModelForCausalLM.from_pretrained(out/hf) 的 GPT2LMHeadModel（transformers 的结构代码）
+  - HF 版模型：AutoModelForCausalLM.from_pretrained(out/export/hf) 的 GPT2LMHeadModel（transformers 的结构代码）
 
 如果两者 logits 一致，说明：
   ① 权重迁移没丢、没转置错（Conv1D 转置正确）
@@ -21,8 +21,8 @@ import torch
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))          # model-core/scripts-export
 PROJ_DIR = os.path.dirname(SRC_DIR)                           # model-core
 LAB_DIR = os.path.dirname(PROJ_DIR)                           # transformer-lab
-CKPT_PATH = os.path.join(PROJ_DIR, "out", "ckpt.pt")
-OUT_HF = os.path.join(PROJ_DIR, "out", "hf")
+CKPT_PATH = os.path.join(PROJ_DIR, "out", "train", "ckpt.pt")
+OUT_HF = os.path.join(PROJ_DIR, "out", "export", "hf")
 
 # 让本脚本能 import model-core 的原始模型（它不在包结构里）
 sys.path.insert(0, os.path.join(PROJ_DIR, "src"))

@@ -10,7 +10,7 @@
      top-k 个专家（计算量只放大 k 倍）。对比「总参数」和「每 token 激活参数」两列就能看懂。
   2. 负载均衡：router 会偷懒坍缩到少数专家（无 aux 时），加 aux loss 后恢复均匀分布。
 
-运行：python scripts/compare_moe.py [--steps N] [--block-size B] [--batch-size M]
+运行：python scripts-compare/compare_moe.py [--steps N] [--block-size B] [--batch-size M]
       [--n-expert E] [--top-k K] [--aux-coef C] [--data PATH]
 """
 import argparse
@@ -20,7 +20,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-# 让脚本能从 scripts/ 直接 import src/ 里的 model（scripts/ 与 src/ 同层）
+# 让脚本能从 scripts-compare/ 直接 import src/ 里的 model（scripts-compare/ 与 src/ 同层）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from model import GPT, GPTConfig

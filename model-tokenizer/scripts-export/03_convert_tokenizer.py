@@ -14,8 +14,8 @@ from transformers import PreTrainedTokenizerFast
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJ_DIR = os.path.dirname(SRC_DIR)
 LAB_DIR = os.path.dirname(PROJ_DIR)
-LIB_TOK_PATH = os.path.join(PROJ_DIR, "out", "lib_tokenizer.json")
-OUT_HF = os.path.join(PROJ_DIR, "out", "hf")
+LIB_TOK_PATH = os.path.join(PROJ_DIR, "out", "train", "lib_tokenizer.json")
+OUT_HF = os.path.join(PROJ_DIR, "out", "export", "hf")
 
 
 def main():
