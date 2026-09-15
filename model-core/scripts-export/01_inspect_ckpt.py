@@ -16,7 +16,7 @@
 这正是「为什么千问下载下来能直接被 Ollama 跑，而我们要带 model.py」的根源：
 数据在这里，代码不在标准工具里。
 
-运行：python src/01_inspect_ckpt.py
+运行：python 01_inspect_ckpt.py
 """
 import os
 

@@ -27,7 +27,7 @@
      是 "gelu_new"（tanh 近似版，GPT-2 原论文用的）。两者数值不同，不改成 "gelu" 会导致
      验证时 logits 对不上。这一步是把「结构细节」也严格对齐。
 
-运行：python src/02_convert_weights.py
+运行：python 02_convert_weights.py
 """
 import os
 

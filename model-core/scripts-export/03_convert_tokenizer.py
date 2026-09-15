@@ -14,7 +14,7 @@
   special_tokens_map.json  —— 特殊 token（char-level 无 bos/eos/unk）
   hf_char_tokenizer.py     —— 代码：类定义（复制过来，供 AutoTokenizer trust_remote_code 加载）
 
-运行：python src/03_convert_tokenizer.py
+运行：python 03_convert_tokenizer.py
 """
 import json
 import os

@@ -5,7 +5,7 @@
 lib_tokenizer.json，这里只需用 PreTrainedTokenizerFast 包装后 save_pretrained，
 产出 tokenizer.json + tokenizer_config.json。这是「工业库 tokenizer」比「自写 char」省事的地方。
 
-运行：python src/03_convert_tokenizer.py
+运行：python 03_convert_tokenizer.py
 """
 import os
 

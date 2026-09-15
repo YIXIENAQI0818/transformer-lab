@@ -1,16 +1,15 @@
 """用 byte-level BPE 训练小模型（步骤 05）。
 
 复用 model-core 的完整训练循环（AdamW + cosine 调度 + 梯度裁剪 + eval + 采样生成），
-tokenizer 用 tokenizers 库的 ByteLevel BPE，模型用纯现代骨架（src/model.py，
-RoPE + RMSNorm + SwiGLU + GQA + FlashAttention）。自写 BpeTokenizer（src/bpe.py）
-保留作参考，训练直接接入工业库。
+tokenizer 用 lib_bpe（tokenizers 库 ByteLevel BPE 的包装），模型用纯现代骨架
+（src/model.py，RoPE + RMSNorm + SwiGLU + GQA + FlashAttention）。
 
 时序：先用 tokenizers 库训好 BPE tokenizer（学出 merge 规则，之后冻结，只做 encode/decode），
 再训模型。tokenizer 单独存 out/train/lib_tokenizer.json，ckpt 只存 model 权重 + config。
 
-运行：
-  python scripts/train_model.py --max-iters 100   # 小步数验证脚本能跑通
-  python scripts/train_model.py                   # 完整训练（GPU ~35min）
+运行（从 model-tokenizer/ 目录）：
+  python scripts-training/train_model.py --max-iters 100   # 小步数验证脚本能跑通
+  python scripts-training/train_model.py                   # 完整训练（GPU ~35min）
 """
 import argparse
 import math

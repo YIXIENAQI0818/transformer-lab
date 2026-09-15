@@ -11,7 +11,7 @@
   ② 结构代码两边等价（激活函数 gelu 对齐、attention 数学一致）
   ③ 「数据 + 代码」在 HF 侧正确组合了
 
-运行：python src/04_verify_hf.py
+运行：python 04_verify_hf.py
 """
 import os
 import sys

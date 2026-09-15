@@ -6,7 +6,7 @@ ckpt 里存「数据」：model（state_dict）+ config（超参）+ iter。toke
 「代码」不在 ckpt 里：模型结构在 model-tokenizer/src/model.py（纯现代骨架），tokenizer 算法在
 tokenizers 库。这正是迁移的起点——把数据按 HF 标准存好、代码对应到 HF 的实现。
 
-运行：python src/01_inspect_ckpt.py
+运行：python 01_inspect_ckpt.py
 """
 import os
 

@@ -6,7 +6,7 @@
 
 若 logits 一致，说明权重迁移没丢、结构代码两边等价（RoPE/RMSNorm/SwiGLU/GQA/Flash 全部对齐）。
 
-运行：python src/04_verify_hf.py
+运行：python 04_verify_hf.py
 """
 import os
 import sys
@@ -23,8 +23,7 @@ OUT_HF = os.path.join(PROJ_DIR, "out", "export", "hf")
 sys.path.insert(0, os.path.join(PROJ_DIR, "src"))
 from model import GPT, GPTConfig                              # noqa: E402  原始模型
 
-from modeling_modern_gpt import ModernGPTForCausalLM          # noqa: E402
-from transformers import AutoTokenizer                        # noqa: E402
+from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
 
 def main():
@@ -36,15 +35,17 @@ def main():
     orig.load_state_dict(ckpt["model"])
     orig.eval().to(device)
 
-    # ---- 2. HF 版模型：ModernGPTForCausalLM.from_pretrained ----
-    hf_model = ModernGPTForCausalLM.from_pretrained(OUT_HF).to(device)
+    # ---- 2. HF 版模型：AutoModelForCausalLM.from_pretrained + trust_remote_code ----
+    # 走 trust_remote_code：真正模拟「别人下载后」的加载——靠 config.json 的 auto_map
+    # 自动找到 modeling_modern_gpt.py 里的 ModernGPTForCausalLM，而非本地 import 绕过。
+    hf_model = AutoModelForCausalLM.from_pretrained(OUT_HF, trust_remote_code=True).to(device)
     hf_model.eval()
 
     # ---- 3. tokenizer：BPE 是标准，AutoTokenizer 直接加载（无需 trust_remote_code）----
     tok = AutoTokenizer.from_pretrained(OUT_HF)
 
     # ---- 4. 同一段输入，两个模型各前向一次 ----
-    text = "First Citizen:\nBefore we proceed any further, hear me speak."
+    text = "ROMEO:"
     ids = tok.encode(text)
     input_ids = torch.tensor([ids], dtype=torch.long, device=device)
     print(f"输入文本: {text[:45]!r}...")
@@ -70,7 +71,9 @@ def main():
     print("HF 模型（ModernGPTForCausalLM）生成示例：")
     print("=" * 60)
     torch.manual_seed(42)
-    gen_ids = hf_model.generate(input_ids, max_new_tokens=100, do_sample=True, temperature=0.8)
+    gen_ids = hf_model.generate(
+        input_ids, max_new_tokens=100, do_sample=True, temperature=0.8
+    )
     print(tok.decode(gen_ids[0].tolist()))
 
 

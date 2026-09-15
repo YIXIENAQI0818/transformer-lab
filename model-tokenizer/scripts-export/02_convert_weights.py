@@ -5,7 +5,7 @@
 「直接 load_state_dict」，零转换。char 时代的 4 个坑（Conv1D 转置 / attn.bias 剔除 /
 token 越界 / 激活对齐）都不存在了——代价是模型类要自己写（见 modeling_modern_gpt.py）。
 
-运行：python src/02_convert_weights.py
+运行：python 02_convert_weights.py
 """
 import os
 

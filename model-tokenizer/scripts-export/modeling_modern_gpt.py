@@ -8,7 +8,7 @@ transformers 里没有现成的类，所以要自己写一个 PreTrainedModel。
 transformer.h.{i}.attn.c_attn.weight、transformer.h.{i}.mlp.gate_proj.weight ...），
 这样权重迁移变成「直接 load_state_dict」，无需 char 时代的 Conv1D 转置 / attn.bias 剔除等坑。
 
-结构（照搬 model-tokenizer/src/model.py，去掉 KV cache 与朴素 toggle）：
+结构（照搬 model-tokenizer/src/model.py，带 KV cache，去掉朴素 toggle）：
     ModernGPTForCausalLM
       └─ transformer (nn.ModuleDict)
            ├─ wte  (token embedding)
@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig, PreTrainedModel
+from transformers.cache_utils import DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -108,7 +109,7 @@ class CausalSelfAttention(nn.Module):
         )
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
-    def forward(self, x):
+    def forward(self, x, position_ids=None, use_causal=True, past_key_values=None, layer_idx=None):
         B, T, C = x.shape
         q, k, v = self.c_attn(x).split(
             [self.n_embd, self.n_kv_head * self.head_size, self.n_kv_head * self.head_size], dim=2
@@ -117,19 +118,31 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_kv_head, self.head_size).transpose(1, 2)
         v = v.view(B, T, self.n_kv_head, self.head_size).transpose(1, 2)
 
-        cos, sin = precompute_rope_cache(self.head_size, T, device=x.device, dtype=x.dtype)
+        # RoPE 绝对位置：position_ids 由外层 forward 在进入层循环前一次性算好
+        # （prefill 从头 0..T-1、decode 从 past_len 起），避免多层 prefill 时每层现调
+        # get_seq_length() 读到前面层已 update 的长度（KV cache + RoPE 的经典 bug）。
+        pos = position_ids if position_ids is not None else torch.arange(T, device=x.device)
+        cos, sin = precompute_rope_cache(
+            self.head_size, int(pos.max().item()) + 1, device=x.device, dtype=x.dtype
+        )
+        cos, sin = cos[pos], sin[pos]
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
+
+        # KV cache：把新 token 的 K/V 追加进 cache，得到完整 K/V（过去 + 新）。
+        if past_key_values is not None:
+            k, v = past_key_values.update(k, v, layer_idx)
 
         if self.n_kv_head != self.n_head:
             n_rep = self.n_head // self.n_kv_head
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
 
+        # 因果 mask：prefill 时 use_causal=True、decode 时 False（由外层 forward 传入）。
         y = F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True,
+            is_causal=use_causal,
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return F.dropout(self.c_proj(y), p=self.dropout, training=self.training)
@@ -164,8 +177,11 @@ class Block(nn.Module):
         self.ln_2 = nn.RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, position_ids=None, use_causal=True, past_key_values=None, layer_idx=None):
+        x = x + self.attn(
+            self.ln_1(x), position_ids=position_ids, use_causal=use_causal,
+            past_key_values=past_key_values, layer_idx=layer_idx
+        )
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -214,16 +230,33 @@ class ModernGPTForCausalLM(PreTrainedModel, GenerationMixin):
     def get_output_embeddings(self):
         return self.lm_head
 
-    def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
+    def forward(self, input_ids, labels=None, attention_mask=None, past_key_values=None,
+                position_ids=None, use_cache=False, **kwargs):
         B, T = input_ids.shape
         x = self.transformer.wte(input_ids)
         x = self.transformer.drop(x)
-        for block in self.transformer.h:
-            x = block(x)
+
+        # use_cache=True 且首次调用（无 cache）时初始化 DynamicCache。
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
+
+        # 进入层循环前，一次性算好绝对位置和因果标志：
+        # - prefill（cache 空，past_len=0）：position_ids=[0..T-1]，use_causal=True
+        # - decode（cache 有内容，past_len>0）：position_ids=[past_len]，use_causal=False
+        # 不能在各层现算 get_seq_length()，因为前面层 update 后长度已变（多层 prefill 的坑）。
+        if position_ids is None:
+            past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(past_len, past_len + T, device=input_ids.device)
+        use_causal = (position_ids.min().item() == 0)
+
+        for i, block in enumerate(self.transformer.h):
+            x = block(x, position_ids=position_ids, use_causal=use_causal,
+                      past_key_values=past_key_values, layer_idx=i)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
         loss = None
         if labels is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
-        return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=None, hidden_states=None, attentions=None)
+        return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values,
+                                      hidden_states=None, attentions=None)

@@ -360,20 +360,21 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """自回归生成（简单版：每步截断到 block_size 重算，不用 KV cache）。
+        """自回归生成（KV cache 增量 decode：prefill 一次 + 每步只算新 token）。
 
-        RoPE 下截断不影响相对位置信息，故生成长度可超过 block_size。
+        复用 forward 的 cache/use_cache 接口（回合 06 KV cache）：prefill 并行算整段 prompt
+        并缓存 K/V，之后每步只算 1 个新 token、复用过去 K/V。RoPE 的绝对位置由 cache 长度给出。
         """
+        logits, cache = self(idx, use_cache=True)          # prefill：并行算整段 prompt
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.config.block_size:]
-            logits = self(idx_cond)  # 无 targets，返回 logits
-            logits = logits[:, -1, :] / temperature
+            logit = logits[:, -1, :] / temperature
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float("-inf")
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+                v, _ = torch.topk(logit, min(top_k, logit.size(-1)))
+                logit[logit < v[:, [-1]]] = float("-inf")
+            probs = F.softmax(logit, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)   # (B, 1)
             idx = torch.cat((idx, idx_next), dim=1)
+            logits, cache = self(idx_next, cache=cache)  # decode：复用 cache 只算新 token
         return idx
 
 
